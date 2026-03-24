@@ -74,6 +74,53 @@ type SinkConfig struct {
 	S3Region      string `yaml:"s3_region"`
 	FlushInterval string `yaml:"flush_interval"`
 	FlushRows     int    `yaml:"flush_rows"`
+	FlushBytes    int64  `yaml:"flush_bytes"`    // flush when buffered bytes exceed this (default 64MB)
+	TargetFileSize int64 `yaml:"target_file_size"` // max parquet file size before rolling (default 128MB)
+
+	// Compaction settings
+	CompactionInterval string `yaml:"compaction_interval"` // e.g. "5m" (default disabled)
+	CompactionTargetSize int64 `yaml:"compaction_target_size"` // target merged file size (default 256MB)
+	CompactionMinFiles   int   `yaml:"compaction_min_files"`   // minimum files to trigger (default 4)
+	MaxSnapshots         int   `yaml:"max_snapshots"`          // pause writes when exceeded (default 0 = unlimited)
+}
+
+func (s SinkConfig) FlushBytesOrDefault() int64 {
+	if s.FlushBytes > 0 {
+		return s.FlushBytes
+	}
+	return 64 * 1024 * 1024 // 64MB
+}
+
+func (s SinkConfig) TargetFileSizeOrDefault() int64 {
+	if s.TargetFileSize > 0 {
+		return s.TargetFileSize
+	}
+	return 128 * 1024 * 1024 // 128MB
+}
+
+func (s SinkConfig) CompactionDuration() time.Duration {
+	if s.CompactionInterval == "" {
+		return 0 // disabled
+	}
+	d, err := time.ParseDuration(s.CompactionInterval)
+	if err != nil {
+		return 0
+	}
+	return d
+}
+
+func (s SinkConfig) CompactionTargetSizeOrDefault() int64 {
+	if s.CompactionTargetSize > 0 {
+		return s.CompactionTargetSize
+	}
+	return 256 * 1024 * 1024 // 256MB
+}
+
+func (s SinkConfig) CompactionMinFilesOrDefault() int {
+	if s.CompactionMinFiles > 0 {
+		return s.CompactionMinFiles
+	}
+	return 4
 }
 
 func (s SinkConfig) FlushDuration() time.Duration {

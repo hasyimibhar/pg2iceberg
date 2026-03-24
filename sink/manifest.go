@@ -243,6 +243,56 @@ func ReadManifestList(data []byte) ([]ManifestFileInfo, error) {
 	return manifests, nil
 }
 
+// ReadManifest reads a manifest Avro file and returns ManifestEntry entries.
+func ReadManifest(data []byte) ([]ManifestEntry, error) {
+	reader, err := goavro.NewOCFReader(ocfReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("open manifest: %w", err)
+	}
+
+	var entries []ManifestEntry
+	for reader.Scan() {
+		record, err := reader.Read()
+		if err != nil {
+			return nil, fmt.Errorf("read manifest entry: %w", err)
+		}
+		m, ok := record.(map[string]any)
+		if !ok {
+			continue
+		}
+
+		entry := ManifestEntry{
+			Status: int(getInt32(m, "status")),
+		}
+		if sid := getUnionLong(m, "snapshot_id"); sid != nil {
+			entry.SnapshotID = *sid
+		}
+
+		if df, ok := m["data_file"].(map[string]any); ok {
+			entry.DataFile = DataFileInfo{
+				Content:       int(getInt32(df, "content")),
+				Path:          getString(df, "file_path"),
+				RecordCount:   getInt64(df, "record_count"),
+				FileSizeBytes: getInt64(df, "file_size_in_bytes"),
+			}
+
+			// Read equality_ids
+			if eqRaw, ok := df["equality_ids"]; ok && eqRaw != nil {
+				if um, ok := eqRaw.(map[string]any); ok {
+					if arr, ok := um["array"].([]any); ok {
+						for _, v := range arr {
+							entry.DataFile.EqualityFieldIDs = append(entry.DataFile.EqualityFieldIDs, int(toAvroInt32(v)))
+						}
+					}
+				}
+			}
+		}
+
+		entries = append(entries, entry)
+	}
+	return entries, nil
+}
+
 func encodeOCF(codec *goavro.Codec, records []any, metadata map[string][]byte) ([]byte, error) {
 	var b bytes.Buffer
 	writer, err := goavro.NewOCFWriter(goavro.OCFConfig{
