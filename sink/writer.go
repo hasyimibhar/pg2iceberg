@@ -18,8 +18,9 @@ type ParquetWriter struct {
 	pqSchema    *parquet.Schema
 	columns     []schema.Column // columns to write (subset for delete files)
 	// colOrder maps column name to its index in the parquet schema's leaf columns.
-	colOrder map[string]int
-	rows     []map[string]any
+	colOrder       map[string]int
+	rows           []map[string]any
+	estimatedBytes int64
 }
 
 // NewDataWriter creates a writer for data files (all columns).
@@ -64,14 +65,144 @@ func schemaColumnOrder(s *parquet.Schema) map[string]int {
 
 func (w *ParquetWriter) Add(row map[string]any) {
 	w.rows = append(w.rows, row)
+	w.estimatedBytes += estimateRowBytes(w.columns, row)
 }
 
 func (w *ParquetWriter) Len() int {
 	return len(w.rows)
 }
 
+func (w *ParquetWriter) EstimatedBytes() int64 {
+	return w.estimatedBytes
+}
+
 func (w *ParquetWriter) Reset() {
 	w.rows = w.rows[:0]
+	w.estimatedBytes = 0
+}
+
+// estimateRowBytes returns a rough byte count for a row based on column types.
+func estimateRowBytes(columns []schema.Column, row map[string]any) int64 {
+	var size int64
+	for _, col := range columns {
+		v := row[col.Name]
+		if v == nil {
+			size += 1 // null bitmap
+			continue
+		}
+		switch strings.ToLower(col.PGType) {
+		case "int2", "smallint", "int4", "integer", "serial":
+			size += 4
+		case "int8", "bigint", "bigserial":
+			size += 8
+		case "float4", "real":
+			size += 4
+		case "float8", "double precision":
+			size += 8
+		case "bool", "boolean":
+			size += 1
+		case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
+			size += 8
+		case "date":
+			size += 4
+		default:
+			// text, varchar, numeric, json, uuid, etc.
+			size += int64(len(toString(v))) + 4 // length prefix
+		}
+	}
+	return size
+}
+
+// FileChunk represents a completed parquet file from the rolling writer.
+type FileChunk struct {
+	Data     []byte
+	RowCount int64
+}
+
+// RollingWriter wraps a ParquetWriter and automatically splits into
+// multiple files when the estimated size exceeds the target.
+type RollingWriter struct {
+	schema     *schema.TableSchema
+	newWriter  func(*schema.TableSchema) *ParquetWriter
+	writer     *ParquetWriter
+	targetSize int64
+	completed  []FileChunk
+}
+
+// NewRollingDataWriter creates a rolling writer for data files.
+func NewRollingDataWriter(ts *schema.TableSchema, targetSize int64) *RollingWriter {
+	return &RollingWriter{
+		schema:     ts,
+		newWriter:  NewDataWriter,
+		writer:     NewDataWriter(ts),
+		targetSize: targetSize,
+	}
+}
+
+// NewRollingDeleteWriter creates a rolling writer for equality delete files.
+func NewRollingDeleteWriter(ts *schema.TableSchema, targetSize int64) *RollingWriter {
+	return &RollingWriter{
+		schema:     ts,
+		newWriter:  NewDeleteWriter,
+		writer:     NewDeleteWriter(ts),
+		targetSize: targetSize,
+	}
+}
+
+func (rw *RollingWriter) Add(row map[string]any) error {
+	rw.writer.Add(row)
+
+	if rw.targetSize > 0 && rw.writer.EstimatedBytes() >= rw.targetSize {
+		if err := rw.rollover(); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (rw *RollingWriter) rollover() error {
+	data, rowCount, err := rw.writer.Flush()
+	if err != nil {
+		return fmt.Errorf("rolling flush: %w", err)
+	}
+	if data != nil {
+		rw.completed = append(rw.completed, FileChunk{Data: data, RowCount: rowCount})
+	}
+	rw.writer.Reset()
+	return nil
+}
+
+// FlushAll flushes any remaining rows and returns all file chunks.
+func (rw *RollingWriter) FlushAll() ([]FileChunk, error) {
+	if rw.writer.Len() > 0 {
+		if err := rw.rollover(); err != nil {
+			return nil, err
+		}
+	}
+	chunks := rw.completed
+	rw.completed = nil
+	return chunks, nil
+}
+
+func (rw *RollingWriter) Len() int {
+	total := rw.writer.Len()
+	for _, c := range rw.completed {
+		total += int(c.RowCount)
+	}
+	return total
+}
+
+func (rw *RollingWriter) EstimatedBytes() int64 {
+	total := rw.writer.EstimatedBytes()
+	for _, c := range rw.completed {
+		total += int64(len(c.Data))
+	}
+	return total
+}
+
+func (rw *RollingWriter) Reset() {
+	rw.writer.Reset()
+	rw.completed = nil
 }
 
 // Flush writes all buffered rows to a Parquet file and returns the bytes.

@@ -90,6 +90,17 @@ func run(ctx context.Context, cfg *config.Config) error {
 		}
 	}
 
+	// Start compactor if configured
+	compactionInterval := cfg.Sink.CompactionDuration()
+	if compactionInterval > 0 {
+		compactor := sink.NewCompactor(cfg.Sink, s, schemas)
+		go compactor.Run(ctx)
+		log.Printf("compactor started (interval=%s, target_size=%dMB, min_files=%d)",
+			compactionInterval,
+			cfg.Sink.CompactionTargetSizeOrDefault()/(1024*1024),
+			cfg.Sink.CompactionMinFilesOrDefault())
+	}
+
 	// Initialize source
 	var src source.Source
 	switch cfg.Source.Mode {
@@ -138,10 +149,12 @@ func run(ctx context.Context, cfg *config.Config) error {
 	defer flushTicker.Stop()
 
 	flushRows := cfg.Sink.FlushRows
-	eventCount := 0
+	flushBytes := cfg.Sink.FlushBytesOrDefault()
 
-	log.Printf("pg2iceberg started (mode=%s, flush_interval=%s, flush_rows=%d)",
-		cfg.Source.Mode, flushInterval, flushRows)
+	log.Printf("pg2iceberg started (mode=%s, flush_interval=%s, flush_rows=%d, flush_bytes=%dMB, target_file_size=%dMB)",
+		cfg.Source.Mode, flushInterval, flushRows,
+		flushBytes/(1024*1024),
+		cfg.Sink.TargetFileSizeOrDefault()/(1024*1024))
 
 	for {
 		select {
@@ -155,22 +168,26 @@ func run(ctx context.Context, cfg *config.Config) error {
 				log.Printf("write error: %v", err)
 				continue
 			}
-			eventCount++
 
 			// Flush on row count threshold
 			if s.TotalBuffered() >= flushRows {
-				if err := flush(ctx, s, src, cfg, store, cp); err != nil {
+				if err := doFlush(ctx, s, src, cfg, store, cp); err != nil {
 					log.Printf("flush error: %v", err)
 				}
-				eventCount = 0
+			}
+
+			// Flush on byte size threshold
+			if s.TotalBufferedBytes() >= flushBytes {
+				if err := doFlush(ctx, s, src, cfg, store, cp); err != nil {
+					log.Printf("flush error: %v", err)
+				}
 			}
 
 		case <-flushTicker.C:
 			if s.ShouldFlush() {
-				if err := flush(ctx, s, src, cfg, store, cp); err != nil {
+				if err := doFlush(ctx, s, src, cfg, store, cp); err != nil {
 					log.Printf("flush error: %v", err)
 				}
-				eventCount = 0
 			}
 
 		case err := <-errCh:
@@ -183,6 +200,14 @@ func run(ctx context.Context, cfg *config.Config) error {
 			return err
 		}
 	}
+}
+
+// doFlush checks backpressure then flushes.
+func doFlush(ctx context.Context, s *sink.Sink, src source.Source, cfg *config.Config, store *state.Store, cp *state.Checkpoint) error {
+	if err := s.CheckBackpressure(ctx); err != nil {
+		return err
+	}
+	return flush(ctx, s, src, cfg, store, cp)
 }
 
 func flush(ctx context.Context, s *sink.Sink, src source.Source, cfg *config.Config, store *state.Store, cp *state.Checkpoint) error {

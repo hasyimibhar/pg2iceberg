@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -21,13 +22,17 @@ type Sink struct {
 
 	// Per-table state
 	tables map[string]*tableSink
+
+	// Backpressure: compactor signals when snapshots are cleaned up.
+	compactionDone chan struct{}
+	mu             sync.Mutex
 }
 
 type tableSink struct {
 	schema      *schema.TableSchema
 	icebergName string // table name in Iceberg catalog
-	dataWriter  *ParquetWriter
-	delWriter   *ParquetWriter
+	dataWriter  *RollingWriter
+	delWriter   *RollingWriter
 	totalRows   int
 }
 
@@ -40,12 +45,19 @@ func NewSink(cfg config.SinkConfig) (*Sink, error) {
 	}
 
 	return &Sink{
-		cfg:     cfg,
-		catalog: catalog,
-		s3:      s3Client,
-		tables:  make(map[string]*tableSink),
+		cfg:            cfg,
+		catalog:        catalog,
+		s3:             s3Client,
+		tables:         make(map[string]*tableSink),
+		compactionDone: make(chan struct{}, 1),
 	}, nil
 }
+
+// Catalog returns the catalog client (for use by compactor).
+func (s *Sink) Catalog() *CatalogClient { return s.catalog }
+
+// S3 returns the S3 client (for use by compactor).
+func (s *Sink) S3() *S3Client { return s.s3 }
 
 // RegisterTable sets up writers for a table and ensures it exists in the catalog.
 func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error {
@@ -73,11 +85,12 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 		log.Printf("[sink] using existing Iceberg table %s.%s", s.cfg.Namespace, icebergTable)
 	}
 
+	targetSize := s.cfg.TargetFileSizeOrDefault()
 	s.tables[ts.Table] = &tableSink{
 		schema:      ts,
 		icebergName: icebergTable,
-		dataWriter:  NewDataWriter(ts),
-		delWriter:   NewDeleteWriter(ts),
+		dataWriter:  NewRollingDataWriter(ts, targetSize),
+		delWriter:   NewRollingDeleteWriter(ts, targetSize),
 	}
 	return nil
 }
@@ -92,29 +105,37 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 	switch event.Operation {
 	case source.OpInsert:
 		if event.After != nil {
-			ts.dataWriter.Add(event.After)
+			if err := ts.dataWriter.Add(event.After); err != nil {
+				return err
+			}
 			ts.totalRows++
 		}
 	case source.OpUpdate:
 		// Equality delete for old row + insert new row
 		if event.Before != nil {
 			pkRow := extractPK(event.Before, event.PK)
-			ts.delWriter.Add(pkRow)
+			if err := ts.delWriter.Add(pkRow); err != nil {
+				return err
+			}
 		}
 		if event.After != nil {
-			ts.dataWriter.Add(event.After)
+			if err := ts.dataWriter.Add(event.After); err != nil {
+				return err
+			}
 			ts.totalRows++
 		}
 	case source.OpDelete:
 		if event.Before != nil {
 			pkRow := extractPK(event.Before, event.PK)
-			ts.delWriter.Add(pkRow)
+			if err := ts.delWriter.Add(pkRow); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
 }
 
-// ShouldFlush checks if any table has hit the flush threshold.
+// ShouldFlush checks if any table has buffered data.
 func (s *Sink) ShouldFlush() bool {
 	for _, ts := range s.tables {
 		if ts.dataWriter.Len()+ts.delWriter.Len() > 0 {
@@ -131,6 +152,58 @@ func (s *Sink) TotalBuffered() int {
 		total += ts.dataWriter.Len() + ts.delWriter.Len()
 	}
 	return total
+}
+
+// TotalBufferedBytes returns the estimated buffered bytes across all tables.
+func (s *Sink) TotalBufferedBytes() int64 {
+	var total int64
+	for _, ts := range s.tables {
+		total += ts.dataWriter.EstimatedBytes() + ts.delWriter.EstimatedBytes()
+	}
+	return total
+}
+
+// CheckBackpressure blocks if the snapshot count exceeds MaxSnapshots,
+// waiting for compaction to reduce it. Returns nil when it's safe to proceed.
+func (s *Sink) CheckBackpressure(ctx context.Context) error {
+	if s.cfg.MaxSnapshots <= 0 {
+		return nil
+	}
+
+	for {
+		overLimit := false
+		for _, ts := range s.tables {
+			tm, err := s.catalog.LoadTable(s.cfg.Namespace, ts.icebergName)
+			if err != nil {
+				return fmt.Errorf("check backpressure: %w", err)
+			}
+			if tm != nil && len(tm.Metadata.Snapshots) >= s.cfg.MaxSnapshots {
+				overLimit = true
+				break
+			}
+		}
+		if !overLimit {
+			return nil
+		}
+
+		log.Printf("[sink] backpressure: snapshot limit (%d) reached, waiting for compaction...", s.cfg.MaxSnapshots)
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-s.compactionDone:
+			// Compaction completed, re-check.
+		case <-time.After(5 * time.Second):
+			// Poll periodically in case we missed a signal.
+		}
+	}
+}
+
+// NotifyCompactionDone signals that compaction has completed (called by compactor).
+func (s *Sink) NotifyCompactionDone() {
+	select {
+	case s.compactionDone <- struct{}{}:
+	default:
+	}
 }
 
 // Flush writes all buffered data to Iceberg for each table.
@@ -150,56 +223,51 @@ func (s *Sink) Flush(ctx context.Context) error {
 func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) error {
 	now := time.Now()
 	snapshotID := now.UnixMilli()
-	fileUUID := uuid.New().String()
 	basePath := fmt.Sprintf("%s.db/%s", s.cfg.Namespace, ts.icebergName)
 
 	var dataFiles []DataFileInfo
 	var deleteFiles []DataFileInfo
 	var manifestInfos []ManifestFileInfo
 
-	// 1. Write data file
-	if ts.dataWriter.Len() > 0 {
-		dataBytes, rowCount, err := ts.dataWriter.Flush()
-		if err != nil {
-			return fmt.Errorf("flush data: %w", err)
-		}
-
-		dataKey := fmt.Sprintf("%s/data/%s-data.parquet", basePath, fileUUID)
-		dataURI, err := s.s3.Upload(ctx, dataKey, dataBytes)
+	// 1. Flush and upload data files (rolling writer may produce multiple)
+	dataChunks, err := ts.dataWriter.FlushAll()
+	if err != nil {
+		return fmt.Errorf("flush data: %w", err)
+	}
+	for i, chunk := range dataChunks {
+		fileUUID := uuid.New().String()
+		dataKey := fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
+		dataURI, err := s.s3.Upload(ctx, dataKey, chunk.Data)
 		if err != nil {
 			return fmt.Errorf("upload data: %w", err)
 		}
-
 		dataFiles = append(dataFiles, DataFileInfo{
 			Path:          dataURI,
-			FileSizeBytes: int64(len(dataBytes)),
-			RecordCount:   rowCount,
+			FileSizeBytes: int64(len(chunk.Data)),
+			RecordCount:   chunk.RowCount,
 			Content:       0, // data
 		})
-		ts.dataWriter.Reset()
 	}
 
-	// 2. Write equality delete file
-	if ts.delWriter.Len() > 0 {
-		delBytes, rowCount, err := ts.delWriter.Flush()
-		if err != nil {
-			return fmt.Errorf("flush deletes: %w", err)
-		}
-
-		delKey := fmt.Sprintf("%s/data/%s-deletes.parquet", basePath, fileUUID)
-		delURI, err := s.s3.Upload(ctx, delKey, delBytes)
+	// 2. Flush and upload equality delete files
+	delChunks, err := ts.delWriter.FlushAll()
+	if err != nil {
+		return fmt.Errorf("flush deletes: %w", err)
+	}
+	for i, chunk := range delChunks {
+		fileUUID := uuid.New().String()
+		delKey := fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
+		delURI, err := s.s3.Upload(ctx, delKey, chunk.Data)
 		if err != nil {
 			return fmt.Errorf("upload deletes: %w", err)
 		}
-
 		deleteFiles = append(deleteFiles, DataFileInfo{
 			Path:             delURI,
-			FileSizeBytes:    int64(len(delBytes)),
-			RecordCount:      rowCount,
+			FileSizeBytes:    int64(len(chunk.Data)),
+			RecordCount:      chunk.RowCount,
 			Content:          2, // equality deletes
 			EqualityFieldIDs: ts.schema.PKFieldIDs(),
 		})
-		ts.delWriter.Reset()
 	}
 
 	// 3. Load current table metadata to get existing manifests
@@ -241,7 +309,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 			return fmt.Errorf("write data manifest: %w", err)
 		}
 
-		manifestKey := fmt.Sprintf("%s/metadata/%s-m0.avro", basePath, fileUUID)
+		manifestKey := fmt.Sprintf("%s/metadata/%s-m0.avro", basePath, uuid.New().String())
 		manifestURI, err := s.s3.Upload(ctx, manifestKey, manifestBytes)
 		if err != nil {
 			return fmt.Errorf("upload data manifest: %w", err)
@@ -277,7 +345,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 			return fmt.Errorf("write delete manifest: %w", err)
 		}
 
-		manifestKey := fmt.Sprintf("%s/metadata/%s-m1.avro", basePath, fileUUID)
+		manifestKey := fmt.Sprintf("%s/metadata/%s-m1.avro", basePath, uuid.New().String())
 		manifestURI, err := s.s3.Upload(ctx, manifestKey, manifestBytes)
 		if err != nil {
 			return fmt.Errorf("upload delete manifest: %w", err)
@@ -340,8 +408,8 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 		delCount += int(df.RecordCount)
 	}
 
-	log.Printf("[sink] committed snapshot %d for %s (seq=%d, data_rows=%d, delete_rows=%d)",
-		snapshotID, pgTable, seqNum, dataCount, delCount)
+	log.Printf("[sink] committed snapshot %d for %s (seq=%d, data_rows=%d, delete_rows=%d, data_files=%d, delete_files=%d)",
+		snapshotID, pgTable, seqNum, dataCount, delCount, len(dataFiles), len(deleteFiles))
 
 	ts.totalRows = 0
 	return nil

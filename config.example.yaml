@@ -34,6 +34,14 @@ sink:
   s3_region: us-east-1
   flush_interval: 10s
   flush_rows: 1000
+  flush_bytes: 67108864        # 64MB - flush when buffered bytes exceed this
+  target_file_size: 134217728  # 128MB - max parquet file size before rolling
+
+  # Compaction settings (optional)
+  # compaction_interval: 5m    # how often to run compaction (disabled if empty)
+  # compaction_target_size: 268435456  # 256MB - target merged file size
+  # compaction_min_files: 4    # minimum small files to trigger compaction
+  # max_snapshots: 0           # pause writes when exceeded (0 = unlimited)
 
 state:
   path: ./pg2iceberg-state.json
