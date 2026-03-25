@@ -16,7 +16,7 @@ graph LR
 ## Quickstart
 
 ```sh
-cd example
+cd example/single
 docker compose up -d --wait
 ```
 

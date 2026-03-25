@@ -86,7 +86,7 @@ services:
 
   pg2iceberg:
     build:
-      context: ..
+      context: ../..
       dockerfile: Dockerfile
     volumes:
       - ./config.yaml:/etc/pg2iceberg/config.yaml
@@ -122,7 +122,7 @@ services:
       DATABASE_URL: postgres://postgres:postgres@postgres:5432/rideshare
     volumes:
       - ./simulate.py:/app/simulate.py
-      - ../scripts/requirements.txt:/app/requirements.txt
+      - ../../scripts/requirements.txt:/app/requirements.txt
     working_dir: /app
     command: sh -c "pip install -q -r requirements.txt && python simulate.py --interval 5"
 

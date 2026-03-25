@@ -1,0 +1,245 @@
+services:
+  # --- Source databases (one per tenant) ---
+
+  postgres-rideshare:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: rideshare
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./rideshare/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./rideshare/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+      - pgdata-rideshare:/var/lib/postgresql/data
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  postgres-cashcat:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: cashcat
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./cashcat/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./cashcat/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+      - pgdata-cashcat:/var/lib/postgresql/data
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  postgres-todoapp:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: todo_app
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    volumes:
+      - ./todo-app/schema.sql:/docker-entrypoint-initdb.d/01-schema.sql
+      - ./todo-app/seed.sql:/docker-entrypoint-initdb.d/02-seed.sql
+      - pgdata-todoapp:/var/lib/postgresql/data
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=4", "-c", "max_wal_senders=4"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # --- Object storage ---
+
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 2s
+      timeout: 5s
+      retries: 5
+
+  create-bucket:
+    image: minio/mc
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set myminio http://minio:9000 admin password;
+      mc mb --ignore-existing myminio/warehouse;
+      exit 0;
+      "
+
+  # --- Iceberg catalog ---
+
+  iceberg-postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: iceberg_catalog
+      POSTGRES_USER: iceberg
+      POSTGRES_PASSWORD: iceberg
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U iceberg"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  iceberg-rest:
+    build: ./iceberg-rest
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+      AWS_REGION: us-east-1
+      CATALOG_CATALOG__IMPL: org.apache.iceberg.jdbc.JdbcCatalog
+      CATALOG_URI: jdbc:postgresql://iceberg-postgres:5432/iceberg_catalog
+      CATALOG_JDBC_USER: iceberg
+      CATALOG_JDBC_PASSWORD: iceberg
+      CATALOG_WAREHOUSE: s3://warehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    ports:
+      - "8181:8181"
+    depends_on:
+      iceberg-postgres:
+        condition: service_healthy
+      create-bucket:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8181/v1/config || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  # --- pg2iceberg pipeline store ---
+
+  postgres-store:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: pg2iceberg
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 10
+
+  # --- pg2iceberg (server mode) ---
+
+  pg2iceberg:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    command:
+      - "--server"
+      - "--listen=:8080"
+      - "--store-dsn=host=postgres-store port=5432 dbname=pg2iceberg user=postgres password=postgres sslmode=disable"
+      - "--clickhouse-addr=http://clickhouse:8123"
+      - "--clickhouse-catalog-uri=http://iceberg-rest:8181/v1"
+      - "--clickhouse-s3-endpoint=http://minio:9000"
+      - "--clickhouse-s3-access-key=admin"
+      - "--clickhouse-s3-secret-key=password"
+      - "--clickhouse-warehouse=s3://warehouse/"
+    depends_on:
+      postgres-store:
+        condition: service_healthy
+      iceberg-rest:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/api/v1/pipelines || exit 1"]
+      interval: 3s
+      timeout: 5s
+      retries: 10
+
+  # --- Create pipelines via API ---
+
+  setup-pipelines:
+    image: curlimages/curl:8.13.0
+    depends_on:
+      pg2iceberg:
+        condition: service_healthy
+      postgres-rideshare:
+        condition: service_healthy
+      postgres-cashcat:
+        condition: service_healthy
+      postgres-todoapp:
+        condition: service_healthy
+    volumes:
+      - ./setup.sh:/setup.sh
+    entrypoint: ["sh", "/setup.sh"]
+
+  # --- ClickHouse ---
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:26.2
+    ports:
+      - "8123:8123"
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password
+    volumes:
+      - ./clickhouse/config.xml:/etc/clickhouse-server/config.d/s3.xml
+      - ./clickhouse/users.xml:/etc/clickhouse-server/users.d/iceberg.xml
+    depends_on:
+      iceberg-rest:
+        condition: service_healthy
+
+  # --- Simulators (one per tenant) ---
+
+  simulate-rideshare:
+    image: python:3.12-slim
+    depends_on:
+      setup-pipelines:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres-rideshare:5432/rideshare
+    volumes:
+      - ./rideshare/simulate.py:/app/simulate.py
+      - ../../scripts/requirements.txt:/app/requirements.txt
+    working_dir: /app
+    command: sh -c "pip install -q -r requirements.txt && python simulate.py --interval 5"
+
+  simulate-cashcat:
+    image: python:3.12-slim
+    depends_on:
+      setup-pipelines:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres-cashcat:5432/cashcat
+    volumes:
+      - ./cashcat/simulate.py:/app/simulate.py
+      - ../../scripts/requirements.txt:/app/requirements.txt
+    working_dir: /app
+    command: sh -c "pip install -q -r requirements.txt && python simulate.py --interval 5"
+
+  simulate-todoapp:
+    image: python:3.12-slim
+    depends_on:
+      setup-pipelines:
+        condition: service_completed_successfully
+    environment:
+      DATABASE_URL: postgres://postgres:postgres@postgres-todoapp:5432/todo_app
+    volumes:
+      - ./todo-app/simulate.py:/app/simulate.py
+      - ../../scripts/requirements.txt:/app/requirements.txt
+    working_dir: /app
+    command: sh -c "pip install -q -r requirements.txt && python simulate.py --interval 5"
+
+volumes:
+  pgdata-rideshare:
+  pgdata-cashcat:
+  pgdata-todoapp:
