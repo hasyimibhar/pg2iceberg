@@ -3,10 +3,13 @@ package api
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/hasyimibhar/pg2iceberg/config"
 	"github.com/hasyimibhar/pg2iceberg/pipeline"
@@ -25,6 +28,7 @@ func NewServer(mgr *pipeline.Manager, addr string) *Server {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/v1/pipelines", s.handlePipelines)
 	mux.HandleFunc("/api/v1/pipelines/", s.handlePipeline)
+	mux.HandleFunc("/api/v1/discover-tables", s.handleDiscoverTables)
 
 	s.server = &http.Server{
 		Addr:    addr,
@@ -195,6 +199,64 @@ func (s *Server) removeTable(w http.ResponseWriter, r *http.Request, pipelineID,
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// handleDiscoverTables connects to a Postgres instance and lists all user tables.
+func (s *Server) handleDiscoverTables(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	var req config.PostgresConfig
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		jsonError(w, "invalid request body: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Database == "" {
+		jsonError(w, "database is required", http.StatusBadRequest)
+		return
+	}
+
+	if req.Port == 0 {
+		req.Port = 5432
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, req.DSN())
+	if err != nil {
+		jsonError(w, "failed to connect: "+err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer conn.Close(ctx)
+
+	rows, err := conn.Query(ctx,
+		`SELECT schemaname || '.' || tablename
+		 FROM pg_tables
+		 WHERE schemaname NOT IN ('pg_catalog', 'information_schema')
+		 ORDER BY schemaname, tablename`)
+	if err != nil {
+		jsonError(w, fmt.Sprintf("failed to query tables: %v", err), http.StatusBadGateway)
+		return
+	}
+	defer rows.Close()
+
+	var tables []string
+	for rows.Next() {
+		var t string
+		if err := rows.Scan(&t); err != nil {
+			jsonError(w, fmt.Sprintf("failed to scan: %v", err), http.StatusInternalServerError)
+			return
+		}
+		tables = append(tables, t)
+	}
+	if tables == nil {
+		tables = []string{}
+	}
+
+	json.NewEncoder(w).Encode(map[string]any{"tables": tables})
 }
 
 func jsonError(w http.ResponseWriter, msg string, code int) {
