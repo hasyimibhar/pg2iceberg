@@ -165,6 +165,18 @@ services:
       timeout: 5s
       retries: 10
 
+  # --- Web UI ---
+
+  pg2iceberg-ui:
+    build:
+      context: ../../ui
+      dockerfile: Dockerfile
+    ports:
+      - "3000:80"
+    depends_on:
+      pg2iceberg:
+        condition: service_healthy
+
   # --- Create pipelines via API ---
 
   setup-pipelines:

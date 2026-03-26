@@ -1,8 +1,7 @@
 import { useEffect, useState, useCallback } from "react";
 import { useNavigate } from "react-router-dom";
 import type { PipelineInfo } from "@/lib/api";
-import { listPipelines, deletePipeline } from "@/lib/api";
-import { CreatePipelineDialog } from "@/components/create-pipeline-dialog";
+import { listPipelines, deletePipeline, modeLabel } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import {
@@ -52,7 +51,6 @@ export function PipelinesPage() {
   const navigate = useNavigate();
   const [pipelines, setPipelines] = useState<PipelineInfo[]>([]);
   const [loading, setLoading] = useState(true);
-  const [createOpen, setCreateOpen] = useState(false);
   const [deleteTarget, setDeleteTarget] = useState<string | null>(null);
 
   const refresh = useCallback(async () => {
@@ -93,7 +91,7 @@ export function PipelinesPage() {
             Manage Postgres to Iceberg replication pipelines.
           </p>
         </div>
-        <Button onClick={() => setCreateOpen(true)}>
+        <Button onClick={() => navigate("/pipelines/new")}>
           <Plus className="mr-1 h-4 w-4" />
           New Pipeline
         </Button>
@@ -158,7 +156,7 @@ export function PipelinesPage() {
                       {p.config.sink.namespace}
                     </TableCell>
                     <TableCell>
-                      <Badge variant="outline">{p.config.source.mode}</Badge>
+                      <Badge variant="outline">{modeLabel(p.config.source.mode)}</Badge>
                     </TableCell>
                     <TableCell>{tableCount}</TableCell>
                     <TableCell>
@@ -199,15 +197,6 @@ export function PipelinesPage() {
           </TableBody>
         </Table>
       </div>
-
-      <CreatePipelineDialog
-        open={createOpen}
-        onOpenChange={setCreateOpen}
-        onCreated={() => {
-          refresh();
-          setCreateOpen(false);
-        }}
-      />
 
       <AlertDialog
         open={deleteTarget !== null}

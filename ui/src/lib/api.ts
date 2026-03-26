@@ -67,6 +67,15 @@ export interface PipelineInfo {
   config: PipelineConfig;
 }
 
+export const modeLabels: Record<string, string> = {
+  logical: "Logical Replication",
+  query: "Query-based",
+};
+
+export function modeLabel(mode: string): string {
+  return modeLabels[mode] ?? mode;
+}
+
 const BASE = "/api/v1";
 
 async function request<T>(
@@ -115,5 +124,12 @@ export function addTable(pipelineId: string, table: string) {
 export function removeTable(pipelineId: string, table: string) {
   return request<void>(`/pipelines/${pipelineId}/tables/${table}`, {
     method: "DELETE",
+  });
+}
+
+export function discoverTables(postgres: PostgresConfig) {
+  return request<{ tables: string[] }>("/discover-tables", {
+    method: "POST",
+    body: JSON.stringify(postgres),
   });
 }
