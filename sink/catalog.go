@@ -102,16 +102,21 @@ func (c *CatalogClient) LoadTable(ns, table string) (*TableMetadata, error) {
 }
 
 // CreateTable creates a new Iceberg table.
-func (c *CatalogClient) CreateTable(ns, table string, ts *schema.TableSchema, location string) (*TableMetadata, error) {
+func (c *CatalogClient) CreateTable(ns, table string, ts *schema.TableSchema, location string, partSpec *PartitionSpec) (*TableMetadata, error) {
 	icebergSchema := schema.IcebergSchemaJSON(ts)
 
+	partitionSpec := map[string]any{
+		"spec-id": 0,
+		"fields":  []any{},
+	}
+	if partSpec != nil && !partSpec.IsUnpartitioned() {
+		partitionSpec = partSpec.CatalogPartitionSpec()
+	}
+
 	body := map[string]any{
-		"name":   table,
-		"schema": icebergSchema,
-		"partition-spec": map[string]any{
-			"spec-id": 0,
-			"fields":  []any{},
-		},
+		"name":           table,
+		"schema":         icebergSchema,
+		"partition-spec": partitionSpec,
 		"write-order": map[string]any{
 			"order-id": 0,
 			"fields":   []any{},

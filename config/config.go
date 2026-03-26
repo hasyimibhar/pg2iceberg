@@ -71,6 +71,16 @@ type LogicalTableConfig struct {
 	SkipSnapshot bool   `yaml:"skip_snapshot" json:"skip_snapshot,omitempty"`
 }
 
+// SinkTableConfig holds per-table sink configuration.
+type SinkTableConfig struct {
+	// Partition defines partition fields using function syntax:
+	//   - "day(created_at)"    → day transform on created_at column
+	//   - "month(event_time)"  → month transform
+	//   - "region"             → identity transform (column name only)
+	// Supported transforms: identity, year, month, day, hour.
+	Partition []string `yaml:"partition" json:"partition,omitempty"`
+}
+
 type SinkConfig struct {
 	CatalogURI     string `yaml:"catalog_uri" json:"catalog_uri"`
 	Warehouse      string `yaml:"warehouse" json:"warehouse"`
@@ -83,6 +93,9 @@ type SinkConfig struct {
 	FlushRows      int    `yaml:"flush_rows" json:"flush_rows"`
 	FlushBytes     int64  `yaml:"flush_bytes" json:"flush_bytes,omitempty"`
 	TargetFileSize int64  `yaml:"target_file_size" json:"target_file_size,omitempty"`
+
+	// Per-table configuration (keyed by PG table name, e.g. "public.orders").
+	Tables map[string]SinkTableConfig `yaml:"tables" json:"tables,omitempty"`
 
 	// Compaction settings
 	CompactionInterval   string `yaml:"compaction_interval" json:"compaction_interval,omitempty"`

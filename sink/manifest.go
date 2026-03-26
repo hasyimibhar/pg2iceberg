@@ -18,6 +18,9 @@ type DataFileInfo struct {
 	Content int
 	// EqualityFieldIDs is set for equality delete files.
 	EqualityFieldIDs []int
+	// PartitionValues holds the Avro-encoded partition values for this file.
+	// Empty map for unpartitioned tables.
+	PartitionValues map[string]any
 }
 
 // ManifestEntry represents a single entry in a manifest file.
@@ -38,8 +41,13 @@ type ManifestFileInfo struct {
 	SequenceNumber  int64
 }
 
-// manifestEntrySchema returns the Avro schema for manifest entries (unpartitioned table).
-func manifestEntrySchema(ts *schema.TableSchema) string {
+// manifestEntrySchema returns the Avro schema for manifest entries.
+func manifestEntrySchema(ts *schema.TableSchema, partSpec *PartitionSpec) string {
+	partSchema := `{"type": "record", "name": "r102", "fields": []}`
+	if partSpec != nil {
+		partSchema = partSpec.PartitionRecordSchemaAvro(ts)
+	}
+
 	return fmt.Sprintf(`{
   "type": "record",
   "name": "manifest_entry",
@@ -71,12 +79,7 @@ func manifestEntrySchema(ts *schema.TableSchema) string {
       ]
     }, "field-id": 2}
   ]
-}`, partitionRecordSchema(ts))
-}
-
-func partitionRecordSchema(_ *schema.TableSchema) string {
-	// Unpartitioned table: empty record
-	return `{"type": "record", "name": "r102", "fields": []}`
+}`, partSchema)
 }
 
 const manifestListSchema = `{
@@ -102,18 +105,25 @@ const manifestListSchema = `{
 }`
 
 // WriteManifest writes a manifest Avro file containing the given entries.
-func WriteManifest(ts *schema.TableSchema, entries []ManifestEntry, seqNum int64, content int) ([]byte, error) {
-	schemaJSON := manifestEntrySchema(ts)
+func WriteManifest(ts *schema.TableSchema, entries []ManifestEntry, seqNum int64, content int, partSpec *PartitionSpec) ([]byte, error) {
+	schemaJSON := manifestEntrySchema(ts, partSpec)
 	codec, err := goavro.NewCodec(schemaJSON)
 	if err != nil {
 		return nil, fmt.Errorf("manifest codec: %w", err)
 	}
 
 	icebergSchemaJSON := icebergSchemaJSONString(ts)
+
+	// Build partition-spec metadata JSON.
+	partSpecJSON := "[]"
+	if partSpec != nil && !partSpec.IsUnpartitioned() {
+		partSpecJSON = partSpec.PartitionSpecJSON()
+	}
+
 	ocfMeta := map[string][]byte{
 		"schema":            []byte(icebergSchemaJSON),
 		"schema-id":         []byte("0"),
-		"partition-spec":    []byte("[]"),
+		"partition-spec":    []byte(partSpecJSON),
 		"partition-spec-id": []byte("0"),
 		"format-version":    []byte("2"),
 		"content":           []byte(contentStr(content)),
@@ -121,11 +131,16 @@ func WriteManifest(ts *schema.TableSchema, entries []ManifestEntry, seqNum int64
 
 	records := make([]any, len(entries))
 	for i, e := range entries {
+		partValues := map[string]any{}
+		if e.DataFile.PartitionValues != nil {
+			partValues = e.DataFile.PartitionValues
+		}
+
 		df := map[string]any{
 			"content":            int32(e.DataFile.Content),
 			"file_path":          e.DataFile.Path,
 			"file_format":        "PARQUET",
-			"partition":          map[string]any{},
+			"partition":          partValues,
 			"record_count":       e.DataFile.RecordCount,
 			"file_size_in_bytes": e.DataFile.FileSizeBytes,
 			"column_sizes":       nil,
