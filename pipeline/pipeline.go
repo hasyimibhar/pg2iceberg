@@ -27,6 +27,18 @@ const (
 	StatusError        Status = "error"
 )
 
+// Metrics holds pipeline metrics exposed via the /metrics endpoint.
+type Metrics struct {
+	Status        Status `json:"status"`
+	BufferedRows  int    `json:"buffered_rows"`
+	BufferedBytes int64  `json:"buffered_bytes"`
+	RowsProcessed  int64  `json:"rows_processed"`
+	BytesProcessed int64  `json:"bytes_processed"`
+	LSN           uint64 `json:"lsn,omitempty"`
+	LastFlushAt   string `json:"last_flush_at,omitempty"`
+	Uptime        string `json:"uptime"`
+}
+
 // Pipeline encapsulates a single source-to-sink replication pipeline.
 type Pipeline struct {
 	id  string
@@ -39,6 +51,11 @@ type Pipeline struct {
 	snk     *sink.Sink
 	store   state.CheckpointStore
 	schemas map[string]*schema.TableSchema
+
+	startedAt     time.Time
+	lastFlushAt   time.Time
+	rowsProcessed  int64
+	bytesProcessed int64
 
 	cancel context.CancelFunc
 	done   chan struct{}
@@ -70,6 +87,37 @@ func (p *Pipeline) Status() (Status, error) {
 
 // Done returns a channel that is closed when the pipeline exits.
 func (p *Pipeline) Done() <-chan struct{} { return p.done }
+
+// Metrics returns a snapshot of the pipeline's current metrics.
+func (p *Pipeline) Metrics() Metrics {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+
+	m := Metrics{
+		Status:        p.status,
+		RowsProcessed:  p.rowsProcessed,
+		BytesProcessed: p.bytesProcessed,
+	}
+
+	if p.snk != nil {
+		m.BufferedRows = p.snk.TotalBuffered()
+		m.BufferedBytes = p.snk.TotalBufferedBytes()
+	}
+
+	if ls, ok := p.src.(*source.LogicalSource); ok {
+		m.LSN = ls.ConfirmedLSN()
+	}
+
+	if !p.lastFlushAt.IsZero() {
+		m.LastFlushAt = p.lastFlushAt.Format(time.RFC3339)
+	}
+
+	if !p.startedAt.IsZero() {
+		m.Uptime = time.Since(p.startedAt).Truncate(time.Second).String()
+	}
+
+	return m
+}
 
 // Start initializes and runs the pipeline. It performs setup synchronously
 // (schema discovery, sink registration) and then spawns the event loop
@@ -234,7 +282,13 @@ func (p *Pipeline) setup(ctx context.Context) error {
 func (p *Pipeline) run(ctx context.Context) {
 	defer close(p.done)
 
-	p.setStatus(StatusRunning, nil)
+	p.mu.Lock()
+	p.startedAt = time.Now()
+	// Only transition to Running if not already Snapshotting (set in initSource).
+	if p.status != StatusSnapshotting {
+		p.status = StatusRunning
+	}
+	p.mu.Unlock()
 
 	events := make(chan source.ChangeEvent, 1000)
 	errCh := make(chan error, 1)
@@ -280,6 +334,7 @@ func (p *Pipeline) run(ctx context.Context) {
 				log.Printf("[pipeline:%s] write error: %v", p.id, err)
 				continue
 			}
+			p.rowsProcessed++
 
 			if p.snk.TotalBuffered() >= flushRows {
 				if err := p.doFlush(ctx); err != nil {
@@ -302,8 +357,11 @@ func (p *Pipeline) run(ctx context.Context) {
 
 		case err := <-errCh:
 			if p.snk.ShouldFlush() {
+				flushedBytes := p.snk.TotalBufferedBytes()
 				if flushErr := p.flush(ctx); flushErr != nil {
 					log.Printf("[pipeline:%s] final flush error: %v", p.id, flushErr)
+				} else {
+					p.bytesProcessed += flushedBytes
 				}
 			}
 			if err != nil && err != context.Canceled {
@@ -318,15 +376,22 @@ func (p *Pipeline) doFlush(ctx context.Context) error {
 	if err := p.snk.CheckBackpressure(ctx); err != nil {
 		return err
 	}
-	return p.flush(ctx)
+	flushedBytes := p.snk.TotalBufferedBytes()
+	err := p.flush(ctx)
+	if err == nil {
+		p.bytesProcessed += flushedBytes
+	}
+	return err
 }
 
 // flushSnapshotComplete flushes any buffered snapshot rows and saves the
 // SnapshotComplete flag to the checkpoint so a restart won't re-snapshot.
 func (p *Pipeline) flushSnapshotComplete(ctx context.Context) error {
+	flushedBytes := p.snk.TotalBufferedBytes()
 	if err := p.snk.Flush(ctx); err != nil {
 		return fmt.Errorf("snapshot flush: %w", err)
 	}
+	p.bytesProcessed += flushedBytes
 
 	cp, err := p.store.Load(p.id)
 	if err != nil {
@@ -352,6 +417,10 @@ func (p *Pipeline) flush(ctx context.Context) error {
 	if err := p.snk.Flush(ctx); err != nil {
 		return fmt.Errorf("flush: %w", err)
 	}
+
+	p.mu.Lock()
+	p.lastFlushAt = time.Now()
+	p.mu.Unlock()
 
 	cp, err := p.store.Load(p.id)
 	if err != nil {

@@ -107,6 +107,20 @@ func (m *Manager) List() []PipelineInfo {
 	return infos
 }
 
+// GetMetrics returns metrics for a pipeline.
+func (m *Manager) GetMetrics(id string) (*Metrics, error) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	p, exists := m.pipelines[id]
+	if !exists {
+		return nil, fmt.Errorf("pipeline %q not found", id)
+	}
+
+	metrics := p.Metrics()
+	return &metrics, nil
+}
+
 // AddTable adds a table to a running pipeline.
 func (m *Manager) AddTable(_ context.Context, pipelineID, tableName string) error {
 	m.mu.RLock()

@@ -78,6 +78,12 @@ func (s *Server) handlePipeline(w http.ResponseWriter, r *http.Request) {
 
 	id := parts[0]
 
+	// /api/v1/pipelines/{id}/metrics
+	if len(parts) >= 2 && parts[1] == "metrics" {
+		s.getPipelineMetrics(w, r, id)
+		return
+	}
+
 	// /api/v1/pipelines/{id}/tables or /api/v1/pipelines/{id}/tables/{name}
 	if len(parts) >= 2 && parts[1] == "tables" {
 		tableName := ""
@@ -159,6 +165,19 @@ func (s *Server) getPipeline(w http.ResponseWriter, r *http.Request, id string) 
 		return
 	}
 	json.NewEncoder(w).Encode(info)
+}
+
+func (s *Server) getPipelineMetrics(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	metrics, err := s.mgr.GetMetrics(id)
+	if err != nil {
+		jsonError(w, err.Error(), http.StatusNotFound)
+		return
+	}
+	json.NewEncoder(w).Encode(metrics)
 }
 
 func (s *Server) deletePipeline(w http.ResponseWriter, r *http.Request, id string) {
