@@ -15,16 +15,23 @@ import (
 
 // Compactor periodically merges small data files and applies equality deletes.
 type Compactor struct {
-	cfg     config.SinkConfig
-	sink    *Sink
-	schemas map[string]*schema.TableSchema
+	cfg        config.SinkConfig
+	sink       *Sink
+	schemas    map[string]*schema.TableSchema
+	partSpecs  map[string]*PartitionSpec // keyed by PG table name
 }
 
 func NewCompactor(cfg config.SinkConfig, s *Sink, schemas map[string]*schema.TableSchema) *Compactor {
+	// Collect partition specs from the sink's registered tables.
+	partSpecs := make(map[string]*PartitionSpec)
+	for pgTable, ts := range s.tables {
+		partSpecs[pgTable] = ts.partSpec
+	}
 	return &Compactor{
-		cfg:     cfg,
-		sink:    s,
-		schemas: schemas,
+		cfg:       cfg,
+		sink:      s,
+		schemas:   schemas,
+		partSpecs: partSpecs,
 	}
 }
 
@@ -203,6 +210,15 @@ func (c *Compactor) CompactTable(ctx context.Context, icebergTable string, ts *s
 		})
 	}
 
+	// Resolve partition spec for this table.
+	var partSpec *PartitionSpec
+	for pgTable, ps := range c.partSpecs {
+		if pgTableToIceberg(pgTable) == icebergTable {
+			partSpec = ps
+			break
+		}
+	}
+
 	// Build new manifest with only the new data files.
 	var newManifestInfos []ManifestFileInfo
 
@@ -215,7 +231,7 @@ func (c *Compactor) CompactTable(ctx context.Context, icebergTable string, ts *s
 				DataFile:   df,
 			}
 		}
-		manifestBytes, err := WriteManifest(ts, entries, seqNum, 0)
+		manifestBytes, err := WriteManifest(ts, entries, seqNum, 0, partSpec)
 		if err != nil {
 			return fmt.Errorf("write compacted manifest: %w", err)
 		}

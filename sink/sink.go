@@ -16,8 +16,9 @@ import (
 
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
 type Sink struct {
-	cfg   config.SinkConfig
-	pgCfg config.PostgresConfig // source PG config for TOAST lookups
+	cfg       config.SinkConfig
+	pgCfg     config.PostgresConfig // source PG config for TOAST lookups
+	tableCfgs []config.TableConfig
 
 	catalog *CatalogClient
 	s3      *S3Client
@@ -36,12 +37,22 @@ type toastPendingRow struct {
 	unchangedCols []string       // columns that need to be fetched
 }
 
+// partitionedWriter holds data and delete writers for a single partition.
+type partitionedWriter struct {
+	dataWriter *RollingWriter
+	delWriter  *RollingWriter
+	partValues map[string]any // partition values for this partition (nil for unpartitioned)
+}
+
 type tableSink struct {
 	schema      *schema.TableSchema
 	icebergName string // table name in Iceberg catalog
-	dataWriter  *RollingWriter
-	delWriter   *RollingWriter
-	totalRows   int
+	partSpec    *PartitionSpec
+	targetSize  int64
+
+	// Per-partition writers, keyed by partition key string ("" for unpartitioned).
+	partitions map[string]*partitionedWriter
+	totalRows  int
 
 	// toastPending tracks rows that have unchanged TOAST columns.
 	// The row references are shared with the dataWriter, so mutating
@@ -49,7 +60,7 @@ type tableSink struct {
 	toastPending []toastPendingRow
 }
 
-func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig) (*Sink, error) {
+func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig) (*Sink, error) {
 	catalog := NewCatalogClient(cfg.CatalogURI)
 
 	s3Client, err := NewS3Client(cfg.S3Endpoint, cfg.S3AccessKey, cfg.S3SecretKey, cfg.S3Region, cfg.Warehouse)
@@ -60,6 +71,7 @@ func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig) (*Sink, error) 
 	return &Sink{
 		cfg:            cfg,
 		pgCfg:          pgCfg,
+		tableCfgs:      tableCfgs,
 		catalog:        catalog,
 		s3:             s3Client,
 		tables:         make(map[string]*tableSink),
@@ -77,6 +89,19 @@ func (s *Sink) S3() *S3Client { return s.s3 }
 func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error {
 	icebergTable := pgTableToIceberg(ts.Table)
 
+	// Build partition spec from config.
+	var partExprs []string
+	for _, tc := range s.tableCfgs {
+		if tc.Name == ts.Table {
+			partExprs = tc.Iceberg.Partition
+			break
+		}
+	}
+	partSpec, err := BuildPartitionSpec(partExprs, ts)
+	if err != nil {
+		return fmt.Errorf("build partition spec: %w", err)
+	}
+
 	// Ensure namespace exists
 	if err := s.catalog.EnsureNamespace(s.cfg.Namespace); err != nil {
 		return fmt.Errorf("ensure namespace: %w", err)
@@ -90,7 +115,7 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 
 	if tm == nil {
 		location := fmt.Sprintf("%s%s.db/%s", s.cfg.Warehouse, s.cfg.Namespace, icebergTable)
-		tm, err = s.catalog.CreateTable(s.cfg.Namespace, icebergTable, ts, location)
+		tm, err = s.catalog.CreateTable(s.cfg.Namespace, icebergTable, ts, location, partSpec)
 		if err != nil {
 			return fmt.Errorf("create table: %w", err)
 		}
@@ -100,12 +125,21 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 	}
 
 	targetSize := s.cfg.TargetFileSizeOrDefault()
-	s.tables[ts.Table] = &tableSink{
+	tSink := &tableSink{
 		schema:      ts,
 		icebergName: icebergTable,
-		dataWriter:  NewRollingDataWriter(ts, targetSize),
-		delWriter:   NewRollingDeleteWriter(ts, targetSize),
+		partSpec:    partSpec,
+		targetSize:  targetSize,
+		partitions:  make(map[string]*partitionedWriter),
 	}
+	// Pre-create the default (unpartitioned) writer if no partition spec.
+	if partSpec.IsUnpartitioned() {
+		tSink.partitions[""] = &partitionedWriter{
+			dataWriter: NewRollingDataWriter(ts, targetSize),
+			delWriter:  NewRollingDeleteWriter(ts, targetSize),
+		}
+	}
+	s.tables[ts.Table] = tSink
 	return nil
 }
 
@@ -114,6 +148,25 @@ func (s *Sink) UnregisterTable(pgTable string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.tables, pgTable)
+}
+
+// getPartitionWriter returns the partitioned writer for a given row, creating it if needed.
+func (ts *tableSink) getPartitionWriter(row map[string]any) *partitionedWriter {
+	if ts.partSpec.IsUnpartitioned() {
+		return ts.partitions[""]
+	}
+
+	key, values := ts.partSpec.PartitionKey(row, ts.schema)
+	pw, ok := ts.partitions[key]
+	if !ok {
+		pw = &partitionedWriter{
+			dataWriter: NewRollingDataWriter(ts.schema, ts.targetSize),
+			delWriter:  NewRollingDeleteWriter(ts.schema, ts.targetSize),
+			partValues: values,
+		}
+		ts.partitions[key] = pw
+	}
+	return pw
 }
 
 // Write buffers a ChangeEvent for the next flush.
@@ -126,21 +179,25 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 	switch event.Operation {
 	case source.OpInsert:
 		if event.After != nil {
-			if err := ts.dataWriter.Add(event.After); err != nil {
+			pw := ts.getPartitionWriter(event.After)
+			if err := pw.dataWriter.Add(event.After); err != nil {
 				return err
 			}
 			ts.totalRows++
 		}
 	case source.OpUpdate:
-		// Equality delete for old row + insert new row
+		// Equality delete for old row (routed by old row's partition).
 		if event.Before != nil {
 			pkRow := extractPK(event.Before, event.PK)
-			if err := ts.delWriter.Add(pkRow); err != nil {
+			pw := ts.getPartitionWriter(event.Before)
+			if err := pw.delWriter.Add(pkRow); err != nil {
 				return err
 			}
 		}
+		// Insert new row (routed by new row's partition).
 		if event.After != nil {
-			if err := ts.dataWriter.Add(event.After); err != nil {
+			pw := ts.getPartitionWriter(event.After)
+			if err := pw.dataWriter.Add(event.After); err != nil {
 				return err
 			}
 			ts.totalRows++
@@ -154,7 +211,8 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 	case source.OpDelete:
 		if event.Before != nil {
 			pkRow := extractPK(event.Before, event.PK)
-			if err := ts.delWriter.Add(pkRow); err != nil {
+			pw := ts.getPartitionWriter(event.Before)
+			if err := pw.delWriter.Add(pkRow); err != nil {
 				return err
 			}
 		}
@@ -165,8 +223,10 @@ func (s *Sink) Write(event source.ChangeEvent) error {
 // ShouldFlush checks if any table has buffered data.
 func (s *Sink) ShouldFlush() bool {
 	for _, ts := range s.tables {
-		if ts.dataWriter.Len()+ts.delWriter.Len() > 0 {
-			return true
+		for _, pw := range ts.partitions {
+			if pw.dataWriter.Len()+pw.delWriter.Len() > 0 {
+				return true
+			}
 		}
 	}
 	return false
@@ -176,7 +236,9 @@ func (s *Sink) ShouldFlush() bool {
 func (s *Sink) TotalBuffered() int {
 	total := 0
 	for _, ts := range s.tables {
-		total += ts.dataWriter.Len() + ts.delWriter.Len()
+		for _, pw := range ts.partitions {
+			total += pw.dataWriter.Len() + pw.delWriter.Len()
+		}
 	}
 	return total
 }
@@ -185,7 +247,9 @@ func (s *Sink) TotalBuffered() int {
 func (s *Sink) TotalBufferedBytes() int64 {
 	var total int64
 	for _, ts := range s.tables {
-		total += ts.dataWriter.EstimatedBytes() + ts.delWriter.EstimatedBytes()
+		for _, pw := range ts.partitions {
+			total += pw.dataWriter.EstimatedBytes() + pw.delWriter.EstimatedBytes()
+		}
 	}
 	return total
 }
@@ -236,7 +300,14 @@ func (s *Sink) NotifyCompactionDone() {
 // Flush writes all buffered data to Iceberg for each table.
 func (s *Sink) Flush(ctx context.Context) error {
 	for pgTable, ts := range s.tables {
-		if ts.dataWriter.Len() == 0 && ts.delWriter.Len() == 0 {
+		hasData := false
+		for _, pw := range ts.partitions {
+			if pw.dataWriter.Len()+pw.delWriter.Len() > 0 {
+				hasData = true
+				break
+			}
+		}
+		if !hasData {
 			continue
 		}
 
@@ -263,45 +334,71 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 	var deleteFiles []DataFileInfo
 	var manifestInfos []ManifestFileInfo
 
-	// 1. Flush and upload data files (rolling writer may produce multiple)
-	dataChunks, err := ts.dataWriter.FlushAll()
-	if err != nil {
-		return fmt.Errorf("flush data: %w", err)
-	}
-	for i, chunk := range dataChunks {
-		fileUUID := uuid.New().String()
-		dataKey := fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
-		dataURI, err := s.s3.Upload(ctx, dataKey, chunk.Data)
-		if err != nil {
-			return fmt.Errorf("upload data: %w", err)
+	// Flush all partitions.
+	for _, pw := range ts.partitions {
+		partPath := ""
+		if ts.partSpec != nil {
+			partPath = ts.partSpec.PartitionPath(pw.partValues)
 		}
-		dataFiles = append(dataFiles, DataFileInfo{
-			Path:          dataURI,
-			FileSizeBytes: int64(len(chunk.Data)),
-			RecordCount:   chunk.RowCount,
-			Content:       0, // data
-		})
-	}
 
-	// 2. Flush and upload equality delete files
-	delChunks, err := ts.delWriter.FlushAll()
-	if err != nil {
-		return fmt.Errorf("flush deletes: %w", err)
-	}
-	for i, chunk := range delChunks {
-		fileUUID := uuid.New().String()
-		delKey := fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
-		delURI, err := s.s3.Upload(ctx, delKey, chunk.Data)
-		if err != nil {
-			return fmt.Errorf("upload deletes: %w", err)
+		// Compute Avro partition values for manifest entries.
+		avroPartValues := map[string]any{}
+		if ts.partSpec != nil && pw.partValues != nil {
+			avroPartValues = ts.partSpec.PartitionAvroValue(pw.partValues, ts.schema)
 		}
-		deleteFiles = append(deleteFiles, DataFileInfo{
-			Path:             delURI,
-			FileSizeBytes:    int64(len(chunk.Data)),
-			RecordCount:      chunk.RowCount,
-			Content:          2, // equality deletes
-			EqualityFieldIDs: ts.schema.PKFieldIDs(),
-		})
+
+		// 1. Flush and upload data files
+		dataChunks, err := pw.dataWriter.FlushAll()
+		if err != nil {
+			return fmt.Errorf("flush data: %w", err)
+		}
+		for i, chunk := range dataChunks {
+			fileUUID := uuid.New().String()
+			var dataKey string
+			if partPath != "" {
+				dataKey = fmt.Sprintf("%s/data/%s/%s-data-%d.parquet", basePath, partPath, fileUUID, i)
+			} else {
+				dataKey = fmt.Sprintf("%s/data/%s-data-%d.parquet", basePath, fileUUID, i)
+			}
+			dataURI, err := s.s3.Upload(ctx, dataKey, chunk.Data)
+			if err != nil {
+				return fmt.Errorf("upload data: %w", err)
+			}
+			dataFiles = append(dataFiles, DataFileInfo{
+				Path:            dataURI,
+				FileSizeBytes:   int64(len(chunk.Data)),
+				RecordCount:     chunk.RowCount,
+				Content:         0, // data
+				PartitionValues: avroPartValues,
+			})
+		}
+
+		// 2. Flush and upload equality delete files
+		delChunks, err := pw.delWriter.FlushAll()
+		if err != nil {
+			return fmt.Errorf("flush deletes: %w", err)
+		}
+		for i, chunk := range delChunks {
+			fileUUID := uuid.New().String()
+			var delKey string
+			if partPath != "" {
+				delKey = fmt.Sprintf("%s/data/%s/%s-deletes-%d.parquet", basePath, partPath, fileUUID, i)
+			} else {
+				delKey = fmt.Sprintf("%s/data/%s-deletes-%d.parquet", basePath, fileUUID, i)
+			}
+			delURI, err := s.s3.Upload(ctx, delKey, chunk.Data)
+			if err != nil {
+				return fmt.Errorf("upload deletes: %w", err)
+			}
+			deleteFiles = append(deleteFiles, DataFileInfo{
+				Path:             delURI,
+				FileSizeBytes:    int64(len(chunk.Data)),
+				RecordCount:      chunk.RowCount,
+				Content:          2, // equality deletes
+				EqualityFieldIDs: ts.schema.PKFieldIDs(),
+				PartitionValues:  avroPartValues,
+			})
+		}
 	}
 
 	// 3. Load current table metadata to get existing manifests
@@ -338,7 +435,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 				DataFile:   df,
 			}
 		}
-		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 0)
+		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 0, ts.partSpec)
 		if err != nil {
 			return fmt.Errorf("write data manifest: %w", err)
 		}
@@ -374,7 +471,7 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 				DataFile:   df,
 			}
 		}
-		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 1)
+		manifestBytes, err := WriteManifest(ts.schema, entries, seqNum, 1, ts.partSpec)
 		if err != nil {
 			return fmt.Errorf("write delete manifest: %w", err)
 		}
@@ -447,6 +544,14 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) er
 
 	ts.totalRows = 0
 	ts.toastPending = nil
+
+	// Clean up empty partition writers (keep the default "" for unpartitioned).
+	if !ts.partSpec.IsUnpartitioned() {
+		for key := range ts.partitions {
+			delete(ts.partitions, key)
+		}
+	}
+
 	return nil
 }
 

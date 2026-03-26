@@ -1,3 +1,20 @@
+tables:
+  - name: public.orders
+  # - name: public.event_log
+  #   skip_snapshot: true    # logical mode: skip initial snapshot, only stream WAL changes
+  #   iceberg:
+  #     partition:
+  #       - day(created_at)       # partition by day on a timestamp column
+  #       - region                # partition by identity on a string column
+  #       # Also supported: year(), month(), hour(), bucket[N](), truncate[W]()
+  #       # - bucket[16](id)      # hash-based bucketing into 16 partitions
+  #       # - truncate[4](name)   # truncate string to first 4 characters
+
+  # Query mode options (used when source.mode=query):
+  # - name: public.orders
+  #   primary_key: [id]
+  #   watermark_column: updated_at
+
 source:
   # "query" or "logical"
   mode: logical
@@ -11,20 +28,12 @@ source:
 
   # Query mode settings (used when mode=query)
   query:
-    tables:
-      - name: public.orders
-        primary_key: [id]
-        watermark_column: updated_at
     poll_interval: 5s
 
   # Logical replication settings (used when mode=logical)
   logical:
     publication_name: pg2iceberg_pub
     slot_name: pg2iceberg_slot
-    tables:
-      - name: public.orders
-      # - name: public.event_log
-      #   skip_snapshot: true    # skip initial snapshot, only stream WAL changes
 
 sink:
   catalog_uri: http://localhost:8181
