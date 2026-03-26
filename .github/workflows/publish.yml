@@ -1,0 +1,109 @@
+name: Publish Docker Images
+
+on:
+  push:
+    tags:
+      - "v*"
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Start services
+        run: |
+          docker compose up -d
+          for i in $(seq 1 30); do
+            docker compose exec -T postgres pg_isready -U postgres >/dev/null 2>&1 && break
+            sleep 1
+          done
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:9000/minio/health/ready >/dev/null 2>&1 && break
+            sleep 1
+          done
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8181/v1/config >/dev/null 2>&1 && break
+            sleep 1
+          done
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:8123 --data-binary "SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Run e2e tests
+        run: ./tests/run.sh
+
+      - name: Show service logs on failure
+        if: failure()
+        run: docker compose logs --tail=50
+
+  publish-server:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  publish-ui:
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/metadata-action@v5
+        id: meta
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}-ui
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: ./ui
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
