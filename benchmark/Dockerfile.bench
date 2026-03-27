@@ -1,0 +1,18 @@
+FROM golang:1.25-alpine AS build
+WORKDIR /src
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+
+RUN CGO_ENABLED=0 go build -o /bench-writer ./benchmark/cmd/bench-writer
+RUN CGO_ENABLED=0 go build -o /bench-verify ./benchmark/cmd/bench-verify
+
+FROM alpine:3.21 AS bench-writer
+RUN apk add --no-cache ca-certificates
+COPY --from=build /bench-writer /usr/local/bin/bench-writer
+ENTRYPOINT ["bench-writer"]
+
+FROM alpine:3.21 AS bench-verify
+RUN apk add --no-cache ca-certificates
+COPY --from=build /bench-verify /usr/local/bin/bench-verify
+ENTRYPOINT ["bench-verify"]

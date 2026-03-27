@@ -3,3 +3,5 @@ pg2iceberg-state.json
 .claude
 .DS_Store
 pg2iceberg
+bench-verify
+bench-writer

@@ -2,11 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"flag"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/pg2iceberg/pg2iceberg/api"
 	"github.com/pg2iceberg/pg2iceberg/config"
@@ -52,10 +55,41 @@ func runSingle(ctx context.Context, configPath string) {
 		log.Fatalf("fatal: %v", err)
 	}
 
+	// Start a lightweight metrics server.
+	metricsAddr := cfg.MetricsAddr
+	if metricsAddr == "" {
+		metricsAddr = ":9090"
+	}
+	startMetricsServer(ctx, metricsAddr, p)
+
 	<-p.Done()
 	if status, err := p.Status(); status == pipeline.StatusError && err != nil {
 		log.Fatalf("fatal: %v", err)
 	}
+}
+
+func startMetricsServer(ctx context.Context, addr string, p *pipeline.Pipeline) {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(p.Metrics())
+	})
+
+	srv := &http.Server{Addr: addr, Handler: mux}
+
+	go func() {
+		<-ctx.Done()
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		srv.Shutdown(shutdownCtx)
+	}()
+
+	go func() {
+		log.Printf("[metrics] listening on %s", addr)
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			log.Printf("[metrics] server error: %v", err)
+		}
+	}()
 }
 
 func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) {

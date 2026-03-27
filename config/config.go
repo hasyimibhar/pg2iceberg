@@ -10,10 +10,11 @@ import (
 )
 
 type Config struct {
-	Tables []TableConfig `yaml:"tables" json:"tables"`
-	Source SourceConfig  `yaml:"source" json:"source"`
-	Sink   SinkConfig    `yaml:"sink" json:"sink"`
-	State  StateConfig   `yaml:"state" json:"state"`
+	Tables      []TableConfig `yaml:"tables" json:"tables"`
+	Source      SourceConfig  `yaml:"source" json:"source"`
+	Sink        SinkConfig    `yaml:"sink" json:"sink"`
+	State       StateConfig   `yaml:"state" json:"state"`
+	MetricsAddr string        `yaml:"metrics_addr" json:"metrics_addr,omitempty"`
 }
 
 // TableConfig describes a table to replicate.
