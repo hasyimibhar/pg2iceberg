@@ -129,18 +129,22 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 		t.Errorf("flushedLSN should NOT advance on receive: got %d, want %d", ls.FlushedLSN(), flushedAfterSnapshot)
 	}
 
-	// Wait for standby update so PG's confirmed_flush_lsn reflects flushedLSN.
-	time.Sleep(12 * time.Second)
+	// Send standby now so PG's confirmed_flush_lsn reflects flushedLSN.
+	if err := ls.SendStandbyNow(ctx); err != nil {
+		t.Fatalf("send standby: %v", err)
+	}
+
+	// Wait for PG to process the standby update.
+	var confirmedBefore string
+	waitFor(t, 5*time.Second, func() bool {
+		_ = conn.QueryRow(ctx, `
+			SELECT confirmed_flush_lsn::text
+			FROM pg_replication_slots WHERE slot_name = 'test_slot'
+		`).Scan(&confirmedBefore)
+		return confirmedBefore != ""
+	})
 
 	// === Assertion 2: PG confirmed_flush_lsn is behind current WAL ===
-	var confirmedBefore string
-	err = conn.QueryRow(ctx, `
-		SELECT confirmed_flush_lsn::text
-		FROM pg_replication_slots WHERE slot_name = 'test_slot'
-	`).Scan(&confirmedBefore)
-	if err != nil {
-		t.Fatalf("query confirmed_flush_lsn: %v", err)
-	}
 
 	var lagBeforeFlush int64
 	err = conn.QueryRow(ctx, `
@@ -171,18 +175,22 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 		t.Errorf("flushedLSN should have advanced after flush: got %d, initial %d", ls.FlushedLSN(), flushedAfterSnapshot)
 	}
 
-	// Wait for standby update to propagate.
-	time.Sleep(12 * time.Second)
+	// Send standby now so PG's confirmed_flush_lsn reflects flushedLSN.
+	if err := ls.SendStandbyNow(ctx); err != nil {
+		t.Fatalf("send standby: %v", err)
+	}
+
+	// Wait for PG to advance confirmed_flush_lsn past the pre-flush value.
+	var confirmedAfter string
+	waitFor(t, 5*time.Second, func() bool {
+		_ = conn.QueryRow(ctx, `
+			SELECT confirmed_flush_lsn::text
+			FROM pg_replication_slots WHERE slot_name = 'test_slot'
+		`).Scan(&confirmedAfter)
+		return confirmedAfter != confirmedBefore
+	})
 
 	// === Assertion 4: PG confirmed_flush_lsn advanced ===
-	var confirmedAfter string
-	err = conn.QueryRow(ctx, `
-		SELECT confirmed_flush_lsn::text
-		FROM pg_replication_slots WHERE slot_name = 'test_slot'
-	`).Scan(&confirmedAfter)
-	if err != nil {
-		t.Fatalf("query confirmed_flush_lsn after flush: %v", err)
-	}
 	t.Logf("PG confirmed_flush_lsn: before=%s after=%s", confirmedBefore, confirmedAfter)
 
 	if confirmedAfter == confirmedBefore {
