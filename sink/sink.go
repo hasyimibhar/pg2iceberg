@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/source"
@@ -30,7 +29,6 @@ type txBuffer struct {
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
 type Sink struct {
 	cfg        config.SinkConfig
-	pgCfg      config.PostgresConfig // source PG config for TOAST lookups
 	tableCfgs  []config.TableConfig
 	pipelineID string // for metrics labeling
 
@@ -48,10 +46,6 @@ type Sink struct {
 	// Backpressure: compactor signals when snapshots are cleaned up.
 	compactionDone chan struct{}
 	mu             sync.Mutex
-
-	// Connection pool for TOAST lookups (lazy-initialized).
-	pgPool   *pgxpool.Pool
-	pgPoolMu sync.Mutex
 }
 
 // toastPendingRow holds a reference to a buffered row that has unchanged TOAST columns.
@@ -78,16 +72,21 @@ type tableSink struct {
 	partitions map[string]*partitionedWriter
 	totalRows  int
 
-	// toastPending tracks rows that have unchanged TOAST columns.
-	// The row references are shared with the dataWriter, so mutating
-	// row[col] here also updates the writer's buffer.
+	// toastPending tracks rows that have unchanged TOAST columns that
+	// could NOT be resolved from the in-memory rowCache. These need
+	// an Iceberg scan fallback (cold path, e.g. after restart).
 	toastPending []toastPendingRow
+
+	// rowCache maps PK key -> latest full row for this table.
+	// Updated on every INSERT/UPDATE with complete column values.
+	// Used to resolve TOAST columns without I/O (hot path).
+	rowCache map[string]map[string]any
 }
 
 // BuildSink creates a fully-wired Sink from config, constructing the default
 // S3 and catalog clients. Use NewSink when you need to inject custom
 // dependencies (e.g. in tests).
-func BuildSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID string) (*Sink, error) {
+func BuildSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string) (*Sink, error) {
 	var httpClient *http.Client
 	if cfg.CatalogAuth == "sigv4" {
 		transport, err := NewSigV4Transport(cfg.S3Region)
@@ -103,14 +102,13 @@ func BuildSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []c
 		return nil, fmt.Errorf("create s3 client: %w", err)
 	}
 
-	return NewSink(cfg, pgCfg, tableCfgs, pipelineID, s3Client, catalog), nil
+	return NewSink(cfg, tableCfgs, pipelineID, s3Client, catalog), nil
 }
 
 // NewSink creates a Sink with the given dependencies.
-func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []config.TableConfig, pipelineID string, s3 ObjectStorage, catalog Catalog) *Sink {
+func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID string, s3 ObjectStorage, catalog Catalog) *Sink {
 	return &Sink{
 		cfg:            cfg,
-		pgCfg:          pgCfg,
 		tableCfgs:      tableCfgs,
 		pipelineID:     pipelineID,
 		catalog:        catalog,
@@ -121,34 +119,8 @@ func NewSink(cfg config.SinkConfig, pgCfg config.PostgresConfig, tableCfgs []con
 	}
 }
 
-// pgConnPool returns the shared connection pool for source PG lookups (TOAST resolution).
-// The pool is lazily created on first use.
-func (s *Sink) pgConnPool(ctx context.Context) (*pgxpool.Pool, error) {
-	s.pgPoolMu.Lock()
-	defer s.pgPoolMu.Unlock()
-
-	if s.pgPool != nil {
-		return s.pgPool, nil
-	}
-
-	pool, err := pgxpool.New(ctx, s.pgCfg.DSN())
-	if err != nil {
-		return nil, fmt.Errorf("create PG connection pool: %w", err)
-	}
-	s.pgPool = pool
-	return pool, nil
-}
-
-// Close releases resources held by the sink.
-func (s *Sink) Close() {
-	s.pgPoolMu.Lock()
-	defer s.pgPoolMu.Unlock()
-
-	if s.pgPool != nil {
-		s.pgPool.Close()
-		s.pgPool = nil
-	}
-}
+// Close is a no-op. Retained for interface compatibility.
+func (s *Sink) Close() {}
 
 // Catalog returns the catalog client (for use by compactor).
 func (s *Sink) Catalog() Catalog { return s.catalog }
@@ -203,6 +175,7 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 		targetSize:  targetSize,
 		schemaID:    tm.Metadata.CurrentSchemaID,
 		partitions:  make(map[string]*partitionedWriter),
+		rowCache:    make(map[string]map[string]any),
 	}
 	// Pre-create the default (unpartitioned) writer if no partition spec.
 	if partSpec.IsUnpartitioned() {
@@ -372,6 +345,9 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 				return err
 			}
 			ts.totalRows++
+			// Cache the full row for future TOAST resolution.
+			pkKey := buildPKKey(event.After, event.PK)
+			ts.rowCache[pkKey] = copyRow(event.After)
 		}
 	case source.OpUpdate:
 		// Equality delete for old row (routed by old row's partition).
@@ -384,16 +360,34 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 		}
 		// Insert new row (routed by new row's partition).
 		if event.After != nil {
+			// Resolve TOAST from in-memory cache (hot path).
+			if len(event.UnchangedCols) > 0 {
+				pkKey := buildPKKey(event.After, event.PK)
+				if cached, ok := ts.rowCache[pkKey]; ok {
+					for _, col := range event.UnchangedCols {
+						event.After[col] = cached[col]
+					}
+					// All TOAST cols resolved — no need for Iceberg fallback.
+					event.UnchangedCols = nil
+				}
+			}
+
 			pw := ts.getPartitionWriter(event.After)
 			if err := pw.dataWriter.Add(event.After); err != nil {
 				return err
 			}
 			ts.totalRows++
+
+			// If TOAST cols remain unresolved (cache miss), defer to Iceberg scan.
 			if len(event.UnchangedCols) > 0 {
 				ts.toastPending = append(ts.toastPending, toastPendingRow{
 					row:           event.After,
 					unchangedCols: event.UnchangedCols,
 				})
+			} else {
+				// Cache the now-complete row.
+				pkKey := buildPKKey(event.After, event.PK)
+				ts.rowCache[pkKey] = copyRow(event.After)
 			}
 		}
 	case source.OpDelete:
@@ -403,6 +397,9 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 			if err := pw.delWriter.Add(pkRow); err != nil {
 				return err
 			}
+			// Remove from cache — row no longer exists.
+			pkKey := buildPKKey(event.Before, event.PK)
+			delete(ts.rowCache, pkKey)
 		}
 	}
 	return nil
@@ -919,6 +916,15 @@ func extractPK(row map[string]any, pk []string) map[string]any {
 		result[col] = row[col]
 	}
 	return result
+}
+
+// copyRow creates a shallow copy of a row map.
+func copyRow(row map[string]any) map[string]any {
+	cp := make(map[string]any, len(row))
+	for k, v := range row {
+		cp[k] = v
+	}
+	return cp
 }
 
 // pgTableToIceberg converts "public.orders" to "orders" for the Iceberg table name.
