@@ -63,24 +63,35 @@ type Pipeline struct {
 	mu     sync.RWMutex
 }
 
+// BuildPipeline creates a fully-wired Pipeline from config, constructing the
+// sink and checkpoint store. Use NewPipeline when you need to inject custom
+// dependencies (e.g. in tests).
+func BuildPipeline(ctx context.Context, id string, cfg *config.Config, sinkOpts ...sink.Option) (*Pipeline, error) {
+	cpStore, err := NewCheckpointStore(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("create checkpoint store: %w", err)
+	}
+
+	snk, err := sink.NewSink(cfg.Sink, cfg.Source.Postgres, cfg.Tables, id, sinkOpts...)
+	if err != nil {
+		cpStore.Close()
+		return nil, fmt.Errorf("create sink: %w", err)
+	}
+
+	return NewPipeline(id, cfg, snk, cpStore), nil
+}
+
 // NewPipeline creates a Pipeline but does not start it.
-func NewPipeline(id string, cfg *config.Config) *Pipeline {
+// The sink and checkpoint store must be created by the caller.
+func NewPipeline(id string, cfg *config.Config, snk *sink.Sink, store state.CheckpointStore) *Pipeline {
 	return &Pipeline{
 		id:     id,
 		cfg:    cfg,
+		snk:    snk,
+		store:  store,
 		status: StatusStopped,
 		done:   make(chan struct{}),
 	}
-}
-
-// WithSink overrides the sink for testing. Must be called before Start.
-func (p *Pipeline) WithSink(snk *sink.Sink) {
-	p.snk = snk
-}
-
-// WithCheckpointStore overrides the checkpoint store for testing. Must be called before Start.
-func (p *Pipeline) WithCheckpointStore(store state.CheckpointStore) {
-	p.store = store
 }
 
 // ID returns the pipeline identifier.
@@ -203,17 +214,10 @@ func (p *Pipeline) setStatus(s Status, err error) {
 	}
 }
 
-// setup performs all synchronous initialization: checkpoint, schema discovery,
+// setup performs all synchronous initialization: schema discovery,
 // sink registration, compactor start, and source creation.
 func (p *Pipeline) setup(ctx context.Context) error {
-	// Load checkpoint (skip creation if already set via WithCheckpointStore).
-	if p.store == nil {
-		store, err := newCheckpointStore(ctx, p.cfg)
-		if err != nil {
-			return fmt.Errorf("create checkpoint store: %w", err)
-		}
-		p.store = store
-	}
+	// Load checkpoint.
 	cp, err := p.store.Load(p.id)
 	if err != nil {
 		return fmt.Errorf("load checkpoint: %w", err)
@@ -239,14 +243,6 @@ func (p *Pipeline) setup(ctx context.Context) error {
 		log.Printf("[pipeline:%s] discovered schema for %s: %d columns, pk=%v", p.id, tc.Name, len(ts.Columns), ts.PK)
 	}
 	pgConn.Close(ctx)
-
-	// Initialize sink (skip if already set via WithSink).
-	if p.snk == nil {
-		p.snk, err = sink.NewSink(p.cfg.Sink, p.cfg.Source.Postgres, p.cfg.Tables, p.id)
-		if err != nil {
-			return fmt.Errorf("create sink: %w", err)
-		}
-	}
 
 	for _, ts := range p.schemas {
 		if err := p.snk.RegisterTable(ctx, ts); err != nil {
@@ -722,7 +718,9 @@ func (p *Pipeline) monitorWALLag(ctx context.Context) {
 	}
 }
 
-func newCheckpointStore(ctx context.Context, cfg *config.Config) (state.CheckpointStore, error) {
+// NewCheckpointStore creates a CheckpointStore from config. It uses a file store
+// if a path is configured, otherwise falls back to Postgres.
+func NewCheckpointStore(ctx context.Context, cfg *config.Config) (state.CheckpointStore, error) {
 	// Explicit file path: use file store (local dev).
 	if cfg.State.Path != "" {
 		return state.NewFileStore(cfg.State.Path), nil

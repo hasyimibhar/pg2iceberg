@@ -89,9 +89,7 @@ func TestPipeline_FlushedLSN_OnlyAdvancesAfterFlush(t *testing.T) {
 		t.Fatalf("create sink: %v", err)
 	}
 
-	p := pipeline.NewPipeline("test", cfg)
-	p.WithSink(snk)
-	p.WithCheckpointStore(state.NewMemStore())
+	p := pipeline.NewPipeline("test", cfg, snk, state.NewMemStore())
 
 	if err := p.Start(ctx); err != nil {
 		t.Fatalf("start pipeline: %v", err)
