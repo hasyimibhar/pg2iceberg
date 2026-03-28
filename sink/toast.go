@@ -165,8 +165,8 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 				resolved++
 			}
 
-			// Cache for future lookups. row is uniquely owned (from readParquetRows).
-			ts.rowCache[pkKey] = row
+			// Cache for future lookups.
+			s.toastCache.put(pgTable, pkKey, row, ts.schema.Columns)
 
 			delete(pendingByPK, pkKey)
 		}
@@ -195,7 +195,7 @@ func (s *Sink) resolveToast(ctx context.Context, pgTable string, ts *tableSink) 
 func partitionKeyFromAvroValues(avroValues map[string]any, partSpec *PartitionSpec) string {
 	parts := make([]string, len(partSpec.Fields))
 	for i, field := range partSpec.Fields {
-		val := avroValues[field.Name]
+		val := unwrapAvroUnion(avroValues[field.Name])
 		if val == nil {
 			parts[i] = "__null__"
 		} else {
@@ -203,6 +203,20 @@ func partitionKeyFromAvroValues(avroValues map[string]any, partSpec *PartitionSp
 		}
 	}
 	return strings.Join(parts, "/")
+}
+
+// unwrapAvroUnion extracts the concrete value from a goavro union wrapper.
+// goavro decodes union types as map[string]any{"type": value}.
+func unwrapAvroUnion(v any) any {
+	if v == nil {
+		return nil
+	}
+	if m, ok := v.(map[string]any); ok && len(m) == 1 {
+		for _, inner := range m {
+			return inner
+		}
+	}
+	return v
 }
 
 // buildPKKey creates a unique key for a row based on its PK columns.

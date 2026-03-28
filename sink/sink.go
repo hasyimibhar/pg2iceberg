@@ -44,6 +44,9 @@ type Sink struct {
 	openTxns      map[uint32]*txBuffer // XID -> in-flight tx
 	committedTxns []*txBuffer          // txns that received Commit, in order
 
+	// Shared LRU cache for TOAST column resolution across all tables.
+	toastCache *toastCache
+
 	// Backpressure: compactor signals when snapshots are cleaned up.
 	compactionDone chan struct{}
 	mu             sync.Mutex
@@ -74,14 +77,9 @@ type tableSink struct {
 	totalRows  int
 
 	// toastPending tracks rows that have unchanged TOAST columns that
-	// could NOT be resolved from the in-memory rowCache. These need
+	// could NOT be resolved from the shared toastCache. These need
 	// an Iceberg scan fallback (cold path, e.g. after restart).
 	toastPending []toastPendingRow
-
-	// rowCache maps PK key -> latest full row for this table.
-	// Updated on every INSERT/UPDATE with complete column values.
-	// Used to resolve TOAST columns without I/O (hot path).
-	rowCache map[string]map[string]any
 }
 
 // BuildSink creates a fully-wired Sink from config, constructing the default
@@ -116,6 +114,7 @@ func NewSink(cfg config.SinkConfig, tableCfgs []config.TableConfig, pipelineID s
 		s3:             s3,
 		tables:         make(map[string]*tableSink),
 		openTxns:       make(map[uint32]*txBuffer),
+		toastCache:     newToastCache(cfg.ToastCacheBytesOrDefault()),
 		compactionDone: make(chan struct{}, 1),
 	}
 }
@@ -176,7 +175,6 @@ func (s *Sink) RegisterTable(ctx context.Context, ts *schema.TableSchema) error 
 		targetSize:  targetSize,
 		schemaID:    tm.Metadata.CurrentSchemaID,
 		partitions:  make(map[string]*partitionedWriter),
-		rowCache:    make(map[string]map[string]any),
 	}
 	// Pre-create the default (unpartitioned) writer if no partition spec.
 	if partSpec.IsUnpartitioned() {
@@ -346,9 +344,12 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 				return err
 			}
 			ts.totalRows++
-			// Cache the full row for future TOAST resolution.
-			pkKey := buildPKKey(event.After, event.PK)
-			ts.rowCache[pkKey] = event.After
+			// Cache TOAST-able columns for future TOAST resolution.
+			// Skip for REPLICA IDENTITY FULL — PG sends complete rows, no TOAST markers.
+			if !ts.schema.ReplicaIdentityFull {
+				pkKey := buildPKKey(event.After, event.PK)
+				s.toastCache.put(event.Table, pkKey, event.After, ts.schema.Columns)
+			}
 		}
 	case source.OpUpdate:
 		// Equality delete for old row (routed by old row's partition).
@@ -361,12 +362,15 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 		}
 		// Insert new row (routed by new row's partition).
 		if event.After != nil {
-			// Resolve TOAST from in-memory cache (hot path).
-			if len(event.UnchangedCols) > 0 {
+			// Resolve TOAST from shared LRU cache (hot path).
+			// Skip for REPLICA IDENTITY FULL — PG sends complete rows, no TOAST markers.
+			if !ts.schema.ReplicaIdentityFull && len(event.UnchangedCols) > 0 {
 				pkKey := buildPKKey(event.After, event.PK)
-				if cached, ok := ts.rowCache[pkKey]; ok {
+				if cached, ok := s.toastCache.get(event.Table, pkKey); ok {
 					for _, col := range event.UnchangedCols {
-						event.After[col] = cached[col]
+						if val, exists := cached[col]; exists {
+							event.After[col] = val
+						}
 					}
 					// All TOAST cols resolved — no need for Iceberg fallback.
 					event.UnchangedCols = nil
@@ -385,10 +389,10 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 					row:           event.After,
 					unchangedCols: event.UnchangedCols,
 				})
-			} else {
+			} else if !ts.schema.ReplicaIdentityFull {
 				// Cache the now-complete row.
 				pkKey := buildPKKey(event.After, event.PK)
-				ts.rowCache[pkKey] = event.After
+				s.toastCache.put(event.Table, pkKey, event.After, ts.schema.Columns)
 			}
 		}
 	case source.OpDelete:
@@ -399,19 +403,15 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 				return err
 			}
 			// Remove from cache — row no longer exists.
-			pkKey := buildPKKey(event.Before, event.PK)
-			delete(ts.rowCache, pkKey)
+			if !ts.schema.ReplicaIdentityFull {
+				pkKey := buildPKKey(event.Before, event.PK)
+				s.toastCache.delete(event.Table, pkKey)
+			}
 		}
 	}
 	return nil
 }
 
-// releaseRowCache returns all row maps in the cache to the source pool.
-func releaseRowCache(cache map[string]map[string]any) {
-	for _, row := range cache {
-		source.ReleaseRow(row)
-	}
-}
 
 // ShouldFlush checks if there are committed transactions ready to flush.
 func (s *Sink) ShouldFlush() bool {
@@ -501,14 +501,14 @@ func (s *Sink) Flush(ctx context.Context) error {
 	// and new ones, producing duplicate data in Iceberg. We only clear
 	// completed chunks — active writer rows (e.g. snapshot data written via
 	// writeDirect) must be preserved.
+	// Note: toastCache (shared LRU) is NOT cleared here — it persists across
+	// flushes so TOAST columns can be resolved from rows inserted in prior batches.
 	for _, ts := range s.tables {
 		for _, pw := range ts.partitions {
 			pw.dataWriter.DiscardCompleted()
 			pw.delWriter.DiscardCompleted()
 		}
 		ts.toastPending = nil
-		releaseRowCache(ts.rowCache)
-		ts.rowCache = make(map[string]map[string]any)
 	}
 
 	// Drain committed transactions into per-table writers.
@@ -666,8 +666,6 @@ func (s *Sink) flushAllTables(ctx context.Context) (map[string]int64, error) {
 		}
 		pf.ts.totalRows = 0
 		pf.ts.toastPending = nil
-		releaseRowCache(pf.ts.rowCache)
-		pf.ts.rowCache = make(map[string]map[string]any)
 		if !pf.ts.partSpec.IsUnpartitioned() {
 			for key := range pf.ts.partitions {
 				delete(pf.ts.partitions, key)
@@ -999,8 +997,6 @@ func (s *Sink) flushTable(ctx context.Context, pgTable string, ts *tableSink) (i
 	}
 	ts.totalRows = 0
 	ts.toastPending = nil
-	releaseRowCache(ts.rowCache)
-	ts.rowCache = make(map[string]map[string]any)
 	if !ts.partSpec.IsUnpartitioned() {
 		for key := range ts.partitions {
 			delete(ts.partitions, key)
