@@ -370,16 +370,25 @@ run_test() {
     fi
 
     # ── Verify via ClickHouse ──
-    ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
-
     local query_sql
     query_sql="$(cat "$query_file")"
 
-    local actual
-    actual=$(ch_query "$query_sql" 2>&1) || true
-
     local expected
     expected="$(cat "$reference_file")"
+
+    # Retry query a few times — ClickHouse schema cache invalidation is async,
+    # so the first query after shutdown may still see stale (empty) state.
+    local actual=""
+    local retry=0
+    while [ $retry -lt 5 ]; do
+        ch_query "SYSTEM DROP SCHEMA CACHE FOR DATABASE iceberg" >/dev/null 2>&1 || true
+        sleep 1
+        actual=$(ch_query "$query_sql" 2>&1) || true
+        if [ "$actual" = "$expected" ]; then
+            break
+        fi
+        retry=$((retry + 1))
+    done
 
     if [ "$actual" = "$expected" ]; then
         echo "  PASS"
