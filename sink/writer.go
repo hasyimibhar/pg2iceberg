@@ -465,6 +465,10 @@ func toTimestampMicros(v any) int64 {
 	switch x := v.(type) {
 	case time.Time:
 		return x.UnixMicro()
+	case int64:
+		return x // already microseconds since epoch (e.g. from parquet roundtrip)
+	case int32:
+		return int64(x)
 	case string:
 		us, _ := fastParseTimestamp(x)
 		return us
@@ -609,6 +613,10 @@ func toDateDays(v any) int32 {
 	switch x := v.(type) {
 	case time.Time:
 		return int32(x.Sub(epoch).Hours() / 24)
+	case int32:
+		return x // already days since epoch (e.g. from parquet roundtrip)
+	case int64:
+		return int32(x)
 	case string:
 		if t, err := time.Parse("2006-01-02", x); err == nil {
 			return int32(t.Sub(epoch).Hours() / 24)

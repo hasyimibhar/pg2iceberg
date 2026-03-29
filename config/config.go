@@ -127,7 +127,11 @@ type SinkConfig struct {
 	// TOAST cache size (bytes). Shared LRU across all tables.
 	ToastCacheBytes int64 `yaml:"toast_cache_bytes" json:"toast_cache_bytes,omitempty"`
 
-	// Compaction settings
+	// Materializer settings
+	MaterializerInterval    string `yaml:"materializer_interval" json:"materializer_interval,omitempty"`
+	MaterializerConcurrency int    `yaml:"materializer_concurrency" json:"materializer_concurrency,omitempty"`
+
+	// Compaction settings (used by materializer for target file size)
 	CompactionInterval   string `yaml:"compaction_interval" json:"compaction_interval,omitempty"`
 	CompactionTargetSize int64  `yaml:"compaction_target_size" json:"compaction_target_size,omitempty"`
 	CompactionMinFiles   int    `yaml:"compaction_min_files" json:"compaction_min_files,omitempty"`
@@ -153,6 +157,27 @@ func (s SinkConfig) ToastCacheBytesOrDefault() int64 {
 		return s.ToastCacheBytes
 	}
 	return 128 * 1024 * 1024 // 128MB
+}
+
+func (s SinkConfig) MaterializerDuration() time.Duration {
+	if s.MaterializerInterval == "" {
+		return 10 * time.Second // default 10s
+	}
+	d, err := time.ParseDuration(s.MaterializerInterval)
+	if err != nil {
+		return 10 * time.Second
+	}
+	return d
+}
+
+// MaterializerConcurrencyOrDefault returns the configured materializer I/O
+// concurrency, defaulting to 16. Since this is I/O-bound (S3 range reads),
+// it should be higher than core count.
+func (s SinkConfig) MaterializerConcurrencyOrDefault() int {
+	if s.MaterializerConcurrency > 0 {
+		return s.MaterializerConcurrency
+	}
+	return 16
 }
 
 func (s SinkConfig) CompactionDuration() time.Duration {
@@ -341,6 +366,11 @@ func (cfg *Config) Validate() error {
 	if cfg.Sink.FlushInterval != "" {
 		if _, err := time.ParseDuration(cfg.Sink.FlushInterval); err != nil {
 			errs = append(errs, fmt.Sprintf("sink.flush_interval: invalid duration %q", cfg.Sink.FlushInterval))
+		}
+	}
+	if cfg.Sink.MaterializerInterval != "" {
+		if _, err := time.ParseDuration(cfg.Sink.MaterializerInterval); err != nil {
+			errs = append(errs, fmt.Sprintf("sink.materializer_interval: invalid duration %q", cfg.Sink.MaterializerInterval))
 		}
 	}
 	if cfg.Sink.CompactionInterval != "" {

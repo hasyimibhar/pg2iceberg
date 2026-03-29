@@ -205,6 +205,7 @@ sink:
   s3_region: us-east-1
   flush_interval: ${FLUSH_INTERVAL}
   flush_rows: ${FLUSH_ROWS}
+  materializer_interval: 5s
 
 state:
   path: ${state_path}
@@ -282,6 +283,7 @@ run_test() {
         pg_exec "DROP TABLE IF EXISTS ${table:-__noop__} CASCADE;" >/dev/null 2>&1 || true
         pg_exec "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots WHERE slot_name = '${slot:-__noop__}' AND NOT active;" >/dev/null 2>&1 || true
         curl -sf -X DELETE "${CATALOG_URI}/v1/namespaces/${NAMESPACE}/tables/${table:-__noop__}" >/dev/null 2>&1 || true
+        curl -sf -X DELETE "${CATALOG_URI}/v1/namespaces/${NAMESPACE}/tables/${table:-__noop__}_events" >/dev/null 2>&1 || true
     }
 
     cleanup_test() {

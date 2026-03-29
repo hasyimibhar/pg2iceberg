@@ -669,10 +669,19 @@ func formatUnscaled(unscaled *big.Int, scale int) string {
 
 // toTime converts a value to time.Time for partition transforms.
 // Uses fastParseTimestamp (microseconds) to avoid time.Parse overhead.
+// Also handles int64 (microseconds since epoch) and int32 (days since epoch)
+// for values roundtripped through parquet.
 func toTime(v any, pgType string) time.Time {
 	switch x := v.(type) {
 	case time.Time:
 		return x
+	case int64:
+		// Microseconds since epoch (from parquet timestamp roundtrip).
+		return time.Unix(x/1_000_000, (x%1_000_000)*1000).UTC()
+	case int32:
+		// Days since epoch (from parquet date roundtrip).
+		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
+		return epoch.AddDate(0, 0, int(x))
 	case string:
 		if strings.ToLower(pgType) == "date" {
 			if len(x) >= 10 && x[4] == '-' && x[7] == '-' {
