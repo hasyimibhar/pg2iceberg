@@ -1,21 +1,10 @@
-.PHONY: build run server docker-up docker-down simulate query clean test
+.PHONY: build run docker-up docker-down simulate query clean test
 
 build:
 	go build -o bin/pg2iceberg ./cmd/pg2iceberg
 
 run: build
 	./bin/pg2iceberg --config config.example.yaml
-
-server: build
-	@docker compose exec -T postgres psql -U postgres -c "CREATE DATABASE pg2iceberg" 2>/dev/null || true
-	./bin/pg2iceberg --server --listen :8080 \
-		--store-url "postgresql://postgres:postgres@localhost:5434/pg2iceberg?sslmode=disable" \
-		--clickhouse-addr http://localhost:8123 \
-		--clickhouse-catalog-uri http://iceberg-rest:8181/v1 \
-		--clickhouse-s3-endpoint http://minio:9000 \
-		--clickhouse-s3-access-key admin \
-		--clickhouse-s3-secret-key password \
-		--clickhouse-warehouse "s3://warehouse/"
 
 docker-up:
 	docker compose up -d

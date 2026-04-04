@@ -13,7 +13,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/pg2iceberg/pg2iceberg/api"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -21,10 +20,6 @@ import (
 
 func main() {
 	configPath := flag.String("config", "config.example.yaml", "path to config file")
-	serverMode := flag.Bool("server", false, "run in multi-tenant API server mode")
-	listenAddr := flag.String("listen", ":8080", "API server listen address")
-	storeDSN := flag.String("store-url", "", "postgres URL for pipeline store, e.g. postgresql://user:pass@host:5432/db (server mode)")
-	storeDir := flag.String("store-dir", "./pipelines", "file-based pipeline store directory (server mode, used if -store-dsn is not set)")
 
 	flag.Parse()
 
@@ -47,12 +42,7 @@ func main() {
 		cancel()
 	}()
 
-	var err error
-	if *serverMode {
-		err = runServer(ctx, *listenAddr, *storeDSN, *storeDir)
-	} else {
-		err = runSingle(ctx, *configPath)
-	}
+	err := runSingle(ctx, *configPath)
 	if err != nil {
 		log.Printf("fatal: %v", err)
 		os.Exit(1)
@@ -90,7 +80,11 @@ func runSingle(ctx context.Context, configPath string) error {
 func startMetricsServer(ctx context.Context, addr string, p *pipeline.Pipeline) {
 	mux := http.NewServeMux()
 	mux.Handle("/metrics", promhttp.Handler())
-	mux.HandleFunc("/status", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+		status, _ := p.Status()
+		if status == pipeline.StatusError {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(p.Metrics())
 	})
@@ -112,34 +106,3 @@ func startMetricsServer(ctx context.Context, addr string, p *pipeline.Pipeline) 
 	}()
 }
 
-func runServer(ctx context.Context, listenAddr, storeDSN, storeDir string) error {
-	var store pipeline.PipelineStore
-
-	if storeDSN != "" {
-		pgStore, err := pipeline.NewPgStore(ctx, storeDSN)
-		if err != nil {
-			return fmt.Errorf("connect to pipeline store: %w", err)
-		}
-		defer pgStore.Close()
-		store = pgStore
-		log.Printf("using postgres pipeline store")
-	} else {
-		store = pipeline.NewFileStore(storeDir)
-		log.Printf("using file-based pipeline store at %s", storeDir)
-	}
-
-	mgr := pipeline.NewManager(ctx, store)
-
-	if err := mgr.RestoreAll(); err != nil {
-		return fmt.Errorf("restore pipelines: %w", err)
-	}
-
-	srv := api.NewServer(mgr, listenAddr)
-
-	go func() {
-		<-ctx.Done()
-		mgr.StopAll()
-	}()
-
-	return srv.Run(ctx)
-}
