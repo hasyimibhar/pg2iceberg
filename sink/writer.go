@@ -8,8 +8,14 @@ import (
 	"strings"
 	"time"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/memory"
+	apq "github.com/apache/arrow-go/v18/parquet"
+	"github.com/apache/arrow-go/v18/parquet/compress"
+	"github.com/apache/arrow-go/v18/parquet/pqarrow"
+
 	"github.com/pg2iceberg/pg2iceberg/schema"
-	"github.com/parquet-go/parquet-go"
 )
 
 // colSizer holds precomputed per-column sizing info to avoid repeated string
@@ -38,99 +44,147 @@ func buildColSizers(columns []schema.Column) []colSizer {
 	return sizers
 }
 
-// colConverter holds precomputed conversion functions per column to avoid
-// strings.ToLower on every row in the parquet encoding hot path.
-type colConverter struct {
-	name     string
-	idx      int // parquet column index
-	nullable bool
-	convert  func(any) parquet.Value // converts a non-nil Go value to parquet
-	zero     parquet.Value           // zero value for non-nullable null
+// colAppender holds precomputed per-column append functions that push values
+// directly into Arrow array builders, avoiding intermediate row storage.
+type colAppender struct {
+	name       string
+	idx        int
+	nullable   bool
+	appendVal  func(array.Builder, any) // appends a non-nil Go value
+	appendZero func(array.Builder)      // appends a typed zero for non-nullable nulls
 }
 
-// buildColConverters precomputes parquet conversion functions for each column.
-func buildColConverters(columns []schema.Column, colOrder map[string]int) []colConverter {
-	converters := make([]colConverter, 0, len(columns))
-	for _, col := range columns {
-		idx, ok := colOrder[col.Name]
-		if !ok {
-			continue
-		}
-		cc := colConverter{
+// buildColAppenders precomputes Arrow builder append functions for each column.
+func buildColAppenders(columns []schema.Column) []colAppender {
+	appenders := make([]colAppender, len(columns))
+	for i, col := range columns {
+		ca := colAppender{
 			name:     col.Name,
-			idx:      idx,
+			idx:      i,
 			nullable: col.IsNullable,
 		}
 		switch strings.ToLower(col.PGType) {
-		case "int2", "smallint":
-			cc.convert = func(v any) parquet.Value { return parquet.Int32Value(toInt32(v)) }
-			cc.zero = parquet.Int32Value(0)
-		case "int4", "integer", "serial":
-			cc.convert = func(v any) parquet.Value { return parquet.Int32Value(toInt32(v)) }
-			cc.zero = parquet.Int32Value(0)
+		case "int2", "smallint", "int4", "integer", "serial":
+			ca.appendVal = func(b array.Builder, v any) { b.(*array.Int32Builder).Append(toInt32(v)) }
+			ca.appendZero = func(b array.Builder) { b.(*array.Int32Builder).Append(0) }
 		case "int8", "bigint", "bigserial":
-			cc.convert = func(v any) parquet.Value { return parquet.Int64Value(toInt64(v)) }
-			cc.zero = parquet.Int64Value(0)
+			ca.appendVal = func(b array.Builder, v any) { b.(*array.Int64Builder).Append(toInt64(v)) }
+			ca.appendZero = func(b array.Builder) { b.(*array.Int64Builder).Append(0) }
 		case "float4", "real":
-			cc.convert = func(v any) parquet.Value { return parquet.FloatValue(toFloat32(v)) }
-			cc.zero = parquet.FloatValue(0)
+			ca.appendVal = func(b array.Builder, v any) { b.(*array.Float32Builder).Append(toFloat32(v)) }
+			ca.appendZero = func(b array.Builder) { b.(*array.Float32Builder).Append(0) }
 		case "float8", "double precision":
-			cc.convert = func(v any) parquet.Value { return parquet.DoubleValue(toFloat64(v)) }
-			cc.zero = parquet.DoubleValue(0)
+			ca.appendVal = func(b array.Builder, v any) { b.(*array.Float64Builder).Append(toFloat64(v)) }
+			ca.appendZero = func(b array.Builder) { b.(*array.Float64Builder).Append(0) }
 		case "bool", "boolean":
-			cc.convert = func(v any) parquet.Value { return parquet.BooleanValue(toBool(v)) }
-			cc.zero = parquet.BooleanValue(false)
+			ca.appendVal = func(b array.Builder, v any) { b.(*array.BooleanBuilder).Append(toBool(v)) }
+			ca.appendZero = func(b array.Builder) { b.(*array.BooleanBuilder).Append(false) }
 		case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
-			cc.convert = func(v any) parquet.Value { return parquet.Int64Value(toTimestampMicros(v)) }
-			cc.zero = parquet.Int64Value(0)
+			ca.appendVal = func(b array.Builder, v any) {
+				b.(*array.TimestampBuilder).Append(arrow.Timestamp(toTimestampMicros(v)))
+			}
+			ca.appendZero = func(b array.Builder) {
+				b.(*array.TimestampBuilder).Append(0)
+			}
 		case "date":
-			cc.convert = func(v any) parquet.Value { return parquet.Int32Value(toDateDays(v)) }
-			cc.zero = parquet.Int32Value(0)
+			ca.appendVal = func(b array.Builder, v any) {
+				b.(*array.Date32Builder).Append(arrow.Date32(toDateDays(v)))
+			}
+			ca.appendZero = func(b array.Builder) {
+				b.(*array.Date32Builder).Append(0)
+			}
 		default:
-			cc.convert = func(v any) parquet.Value { return parquet.ByteArrayValue([]byte(toString(v))) }
-			cc.zero = parquet.ByteArrayValue([]byte(""))
+			// text, varchar, numeric, json, uuid, etc. → string
+			ca.appendVal = func(b array.Builder, v any) { b.(*array.StringBuilder).Append(toString(v)) }
+			ca.appendZero = func(b array.Builder) { b.(*array.StringBuilder).Append("") }
 		}
-		converters = append(converters, cc)
+		appenders[i] = ca
 	}
-	return converters
+	return appenders
 }
 
-// ParquetWriter accumulates rows and flushes them as a Parquet file.
-type ParquetWriter struct {
-	tableSchema   *schema.TableSchema
-	pqSchema      *parquet.Schema
-	columns       []schema.Column   // columns to write (subset for delete files)
-	colSizers     []colSizer        // precomputed per-column sizing
-	colConverters []colConverter     // precomputed parquet converters
-	// colOrder maps column name to its index in the parquet schema's leaf columns.
-	colOrder       map[string]int
-	rows           []map[string]any
-	estimatedBytes int64
+// pgToArrowType maps a PostgreSQL column type to an Arrow data type.
+func pgToArrowType(pgType string) arrow.DataType {
+	switch strings.ToLower(pgType) {
+	case "int2", "smallint", "int4", "integer", "serial":
+		return arrow.PrimitiveTypes.Int32
+	case "int8", "bigint", "bigserial":
+		return arrow.PrimitiveTypes.Int64
+	case "float4", "real":
+		return arrow.PrimitiveTypes.Float32
+	case "float8", "double precision":
+		return arrow.PrimitiveTypes.Float64
+	case "bool", "boolean":
+		return arrow.FixedWidthTypes.Boolean
+	case "timestamptz", "timestamp with time zone":
+		return &arrow.TimestampType{Unit: arrow.Microsecond, TimeZone: "UTC"}
+	case "timestamp", "timestamp without time zone":
+		return &arrow.TimestampType{Unit: arrow.Microsecond}
+	case "date":
+		return arrow.FixedWidthTypes.Date32
+	default:
+		return arrow.BinaryTypes.String
+	}
+}
 
-	// Reusable parquet encoding state — avoids re-allocating internal column
-	// buffers on every flush.
-	rowBuf   *parquet.Buffer
-	pqWriter *parquet.Writer
-	outBuf   bytes.Buffer
-	pqRow    parquet.Row
+// buildArrowSchema creates an Arrow schema from the column definitions.
+func buildArrowSchema(columns []schema.Column) *arrow.Schema {
+	fields := make([]arrow.Field, len(columns))
+	for i, col := range columns {
+		fields[i] = arrow.Field{
+			Name:     col.Name,
+			Type:     pgToArrowType(col.PGType),
+			Nullable: col.IsNullable,
+		}
+	}
+	return arrow.NewSchema(fields, nil)
+}
+
+// buildBuilders creates one Arrow array builder per schema field.
+func buildBuilders(sc *arrow.Schema) []array.Builder {
+	builders := make([]array.Builder, sc.NumFields())
+	for i, f := range sc.Fields() {
+		builders[i] = array.NewBuilder(memory.DefaultAllocator, f.Type)
+	}
+	return builders
+}
+
+// parquetWriterProps are shared across all ParquetWriter instances.
+var parquetWriterProps = apq.NewWriterProperties(
+	apq.WithCompression(compress.Codecs.Snappy),
+	apq.WithVersion(apq.V2_LATEST),
+)
+
+// ParquetWriter accumulates rows into columnar Arrow builders and flushes
+// them as a Parquet file via pqarrow. Values are appended directly into
+// typed builders in Add(), eliminating intermediate row storage.
+type ParquetWriter struct {
+	tableSchema    *schema.TableSchema
+	arrowSchema    *arrow.Schema
+	columns        []schema.Column
+	colSizers      []colSizer
+	colAppenders   []colAppender
+	builders       []array.Builder
+	rowCount       int64
+	estimatedBytes int64
+	outBuf         bytes.Buffer
+}
+
+func newParquetWriter(ts *schema.TableSchema, columns []schema.Column) *ParquetWriter {
+	arrowSchema := buildArrowSchema(columns)
+	return &ParquetWriter{
+		tableSchema:  ts,
+		arrowSchema:  arrowSchema,
+		columns:      columns,
+		colSizers:    buildColSizers(columns),
+		colAppenders: buildColAppenders(columns),
+		builders:     buildBuilders(arrowSchema),
+	}
 }
 
 // NewDataWriter creates a writer for data files (all columns).
 func NewDataWriter(ts *schema.TableSchema) *ParquetWriter {
-	pqSchema := buildParquetSchema("data", ts.Columns)
-	colOrder := schemaColumnOrder(pqSchema)
-	w := &ParquetWriter{
-		tableSchema:   ts,
-		pqSchema:      pqSchema,
-		columns:       ts.Columns,
-		colSizers:     buildColSizers(ts.Columns),
-		colConverters: buildColConverters(ts.Columns, colOrder),
-		colOrder:      colOrder,
-		rowBuf:        parquet.NewBuffer(pqSchema),
-		pqRow:         make(parquet.Row, len(colOrder)),
-	}
-	w.pqWriter = parquet.NewWriter(&w.outBuf)
-	return w
+	return newParquetWriter(ts, ts.Columns)
 }
 
 // NewDeleteWriter creates a writer for equality delete files (PK columns only).
@@ -144,38 +198,29 @@ func NewDeleteWriter(ts *schema.TableSchema) *ParquetWriter {
 			}
 		}
 	}
-	pqSchema := buildParquetSchema("equality_delete", pkCols)
-	colOrder := schemaColumnOrder(pqSchema)
-	w := &ParquetWriter{
-		tableSchema:   ts,
-		pqSchema:      pqSchema,
-		columns:       pkCols,
-		colSizers:     buildColSizers(pkCols),
-		colConverters: buildColConverters(pkCols, colOrder),
-		colOrder:      colOrder,
-		rowBuf:        parquet.NewBuffer(pqSchema),
-		pqRow:         make(parquet.Row, len(colOrder)),
-	}
-	w.pqWriter = parquet.NewWriter(&w.outBuf)
-	return w
-}
-
-// schemaColumnOrder extracts the leaf column ordering from a parquet schema.
-func schemaColumnOrder(s *parquet.Schema) map[string]int {
-	order := make(map[string]int)
-	for i, field := range s.Fields() {
-		order[field.Name()] = i
-	}
-	return order
+	return newParquetWriter(ts, pkCols)
 }
 
 func (w *ParquetWriter) Add(row map[string]any) {
-	w.rows = append(w.rows, row)
+	for i := range w.colAppenders {
+		ca := &w.colAppenders[i]
+		v := row[ca.name]
+		if v == nil {
+			if ca.nullable {
+				w.builders[ca.idx].AppendNull()
+			} else {
+				ca.appendZero(w.builders[ca.idx])
+			}
+		} else {
+			ca.appendVal(w.builders[ca.idx], v)
+		}
+	}
+	w.rowCount++
 	w.estimatedBytes += estimateRowBytes(w.colSizers, row)
 }
 
 func (w *ParquetWriter) Len() int {
-	return len(w.rows)
+	return int(w.rowCount)
 }
 
 func (w *ParquetWriter) EstimatedBytes() int64 {
@@ -183,13 +228,11 @@ func (w *ParquetWriter) EstimatedBytes() int64 {
 }
 
 func (w *ParquetWriter) Reset() {
-	// Nil out references so GC can collect row maps between flushes.
-	// Row maps are NOT released to the pool here because some may still
-	// be referenced by rowCache. They are released when rowCache is cleared.
-	for i := range w.rows {
-		w.rows[i] = nil
+	for _, b := range w.builders {
+		b.Release()
 	}
-	w.rows = w.rows[:0]
+	w.builders = buildBuilders(w.arrowSchema)
+	w.rowCount = 0
 	w.estimatedBytes = 0
 }
 
@@ -209,6 +252,47 @@ func estimateRowBytes(sizers []colSizer, row map[string]any) int64 {
 		}
 	}
 	return size
+}
+
+// Flush builds an Arrow record from the accumulated builders and writes it
+// to a Parquet file. The builders are reset after the record is constructed.
+func (w *ParquetWriter) Flush() ([]byte, int64, error) {
+	if w.rowCount == 0 {
+		return nil, 0, nil
+	}
+
+	// Build arrays from builders (also resets builders for reuse).
+	arrays := make([]arrow.Array, len(w.builders))
+	for i, b := range w.builders {
+		arrays[i] = b.NewArray()
+	}
+	rec := array.NewRecordBatch(w.arrowSchema, arrays, w.rowCount)
+	defer rec.Release()
+	for _, a := range arrays {
+		a.Release()
+	}
+
+	// Write the record to Parquet.
+	w.outBuf.Reset()
+	w.outBuf.Grow(int(w.estimatedBytes))
+
+	fw, err := pqarrow.NewFileWriter(w.arrowSchema, &w.outBuf, parquetWriterProps, pqarrow.DefaultWriterProps())
+	if err != nil {
+		return nil, 0, fmt.Errorf("create parquet writer: %w", err)
+	}
+	if err := fw.Write(rec); err != nil {
+		return nil, 0, fmt.Errorf("write record batch: %w", err)
+	}
+	if err := fw.Close(); err != nil {
+		return nil, 0, fmt.Errorf("close parquet writer: %w", err)
+	}
+
+	// Copy output — the caller takes ownership and outBuf will be reused.
+	out := make([]byte, w.outBuf.Len())
+	copy(out, w.outBuf.Bytes())
+
+	count := w.rowCount
+	return out, count, nil
 }
 
 // FileChunk represents a completed parquet file from the rolling writer.
@@ -315,148 +399,6 @@ func (rw *RollingWriter) Reset() {
 // while preserving data written directly to the writer (e.g. snapshot rows).
 func (rw *RollingWriter) DiscardCompleted() {
 	rw.completed = nil
-}
-
-// Flush writes all buffered rows to a Parquet file and returns the bytes.
-func (w *ParquetWriter) Flush() ([]byte, int64, error) {
-	if len(w.rows) == 0 {
-		return nil, 0, nil
-	}
-
-	w.rowBuf.Reset()
-	batch := [1]parquet.Row{} // stack-allocated single-element batch for WriteRows
-
-	for _, row := range w.rows {
-		w.encodeRowInto(w.pqRow, row)
-		batch[0] = w.pqRow
-		if _, err := w.rowBuf.WriteRows(batch[:]); err != nil {
-			return nil, 0, fmt.Errorf("write row to buffer: %w", err)
-		}
-	}
-
-	w.outBuf.Reset()
-	w.outBuf.Grow(int(w.estimatedBytes))
-	w.pqWriter.Reset(&w.outBuf)
-	if _, err := w.pqWriter.WriteRowGroup(w.rowBuf); err != nil {
-		return nil, 0, fmt.Errorf("write row group: %w", err)
-	}
-	if err := w.pqWriter.Close(); err != nil {
-		return nil, 0, fmt.Errorf("close writer: %w", err)
-	}
-
-	// Copy output — the caller takes ownership and outBuf will be reused.
-	out := make([]byte, w.outBuf.Len())
-	copy(out, w.outBuf.Bytes())
-
-	count := int64(len(w.rows))
-	return out, count, nil
-}
-
-// encodeRowInto populates the pre-allocated dst slice with parquet values.
-func (w *ParquetWriter) encodeRowInto(dst parquet.Row, data map[string]any) {
-	for i := range w.colConverters {
-		cc := &w.colConverters[i]
-		v := data[cc.name]
-		if v == nil {
-			if cc.nullable {
-				dst[cc.idx] = parquet.Value{}.Level(0, 0, cc.idx)
-			} else {
-				dst[cc.idx] = cc.zero.Level(0, 0, cc.idx)
-			}
-			continue
-		}
-		pv := cc.convert(v)
-		if cc.nullable {
-			dst[cc.idx] = pv.Level(0, 1, cc.idx)
-		} else {
-			dst[cc.idx] = pv.Level(0, 0, cc.idx)
-		}
-	}
-}
-
-func zeroValue(col schema.Column) parquet.Value {
-	switch strings.ToLower(col.PGType) {
-	case "int2", "smallint", "int4", "integer", "serial":
-		return parquet.Int32Value(0)
-	case "int8", "bigint", "bigserial":
-		return parquet.Int64Value(0)
-	case "float4", "real":
-		return parquet.FloatValue(0)
-	case "float8", "double precision":
-		return parquet.DoubleValue(0)
-	case "bool", "boolean":
-		return parquet.BooleanValue(false)
-	case "timestamptz", "timestamp with time zone", "timestamp", "timestamp without time zone":
-		return parquet.Int64Value(0)
-	case "date":
-		return parquet.Int32Value(0)
-	default:
-		return parquet.ByteArrayValue([]byte(""))
-	}
-}
-
-func toParquetValue(col schema.Column, v any) parquet.Value {
-	switch strings.ToLower(col.PGType) {
-	case "int2", "smallint":
-		return parquet.Int32Value(toInt32(v))
-	case "int4", "integer", "serial":
-		return parquet.Int32Value(toInt32(v))
-	case "int8", "bigint", "bigserial":
-		return parquet.Int64Value(toInt64(v))
-	case "float4", "real":
-		return parquet.FloatValue(toFloat32(v))
-	case "float8", "double precision":
-		return parquet.DoubleValue(toFloat64(v))
-	case "bool", "boolean":
-		return parquet.BooleanValue(toBool(v))
-	case "timestamptz", "timestamp with time zone":
-		return parquet.Int64Value(toTimestampMicros(v))
-	case "timestamp", "timestamp without time zone":
-		return parquet.Int64Value(toTimestampMicros(v))
-	case "date":
-		return parquet.Int32Value(toDateDays(v))
-	default:
-		// text, varchar, numeric, json, uuid, etc. → string
-		return parquet.ByteArrayValue([]byte(toString(v)))
-	}
-}
-
-func buildParquetSchema(name string, columns []schema.Column) *parquet.Schema {
-	group := make(parquet.Group)
-	for _, col := range columns {
-		node := pgToParquetNode(col.PGType)
-		if col.IsNullable {
-			node = parquet.Optional(node)
-		}
-		// Iceberg requires PARQUET:field_id on each column so readers
-		// (DuckDB, Spark, etc.) can map columns by field ID, not name.
-		node = parquet.FieldID(node, col.FieldID)
-		group[col.Name] = node
-	}
-	return parquet.NewSchema(name, group)
-}
-
-func pgToParquetNode(pgType string) parquet.Node {
-	switch strings.ToLower(pgType) {
-	case "int2", "smallint", "int4", "integer", "serial":
-		return parquet.Leaf(parquet.Int32Type)
-	case "int8", "bigint", "bigserial":
-		return parquet.Leaf(parquet.Int64Type)
-	case "float4", "real":
-		return parquet.Leaf(parquet.FloatType)
-	case "float8", "double precision":
-		return parquet.Leaf(parquet.DoubleType)
-	case "bool", "boolean":
-		return parquet.Leaf(parquet.BooleanType)
-	case "timestamptz", "timestamp with time zone":
-		return parquet.Timestamp(parquet.Microsecond)
-	case "timestamp", "timestamp without time zone":
-		return parquet.Timestamp(parquet.Microsecond)
-	case "date":
-		return parquet.Date()
-	default:
-		return parquet.String()
-	}
 }
 
 // --- type conversion helpers ---
