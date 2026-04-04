@@ -6,7 +6,8 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"sort"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -23,37 +24,46 @@ import (
 // the Sink (producer) and the Materializer (consumer). Created before both and
 // injected into each, avoiding a circular dependency.
 type ChangeEventBuffer struct {
-	events map[string][]changeEvent
-	mu     sync.Mutex
+	events     map[string][]changeEvent
+	snapshotID map[string]int64 // latest events table snapshot ID per table
+	mu         sync.Mutex
 }
 
 // NewChangeEventBuffer creates a new empty event buffer.
 func NewChangeEventBuffer() *ChangeEventBuffer {
-	return &ChangeEventBuffer{events: make(map[string][]changeEvent)}
+	return &ChangeEventBuffer{
+		events:     make(map[string][]changeEvent),
+		snapshotID: make(map[string]int64),
+	}
 }
 
 // PushEvents adds change events for a table. Called by the Sink after flush.
-func (b *ChangeEventBuffer) PushEvents(pgTable string, events []changeEvent) {
+// snapshotID is the events table snapshot that produced these events.
+func (b *ChangeEventBuffer) PushEvents(pgTable string, events []changeEvent, snapshotID int64) {
 	if b == nil {
 		return
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.events[pgTable] = append(b.events[pgTable], events...)
+	b.snapshotID[pgTable] = snapshotID
 	metrics.MaterializerBufferSize.WithLabelValues(pgTable).Set(float64(len(b.events[pgTable])))
 }
 
-// Drain removes and returns all buffered events for a table.
-func (b *ChangeEventBuffer) Drain(pgTable string) []changeEvent {
+// Drain removes and returns all buffered events for a table,
+// along with the latest events snapshot ID.
+func (b *ChangeEventBuffer) Drain(pgTable string) ([]changeEvent, int64) {
 	if b == nil {
-		return nil
+		return nil, 0
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	events := b.events[pgTable]
+	snapID := b.snapshotID[pgTable]
 	delete(b.events, pgTable)
+	delete(b.snapshotID, pgTable)
 	metrics.MaterializerBufferSize.WithLabelValues(pgTable).Set(0)
-	return events
+	return events, snapID
 }
 
 // fileIndex tracks which PKs live in which data files for a single table.
@@ -201,7 +211,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	ns := m.cfg.Namespace
 
 	// Prefer in-memory events (fast path: no S3 reads).
-	events := m.buf.Drain(pgTable)
+	events, bufSnapID := m.buf.Drain(pgTable)
 	fromBuffer := len(events) > 0
 
 	if !fromBuffer {
@@ -243,131 +253,19 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		m.lastEventsSnapshot[pgTable] = currentSnapshotID
 	}
 
-	// Sort events by _seq (globally monotonic counter) to ensure correct ordering.
-	sort.Slice(events, func(i, j int) bool {
-		return events[i].seq < events[j].seq
-	})
+	// Phase timing for diagnostics.
+	tDrain := time.Since(start)
 
-	// Group events by PK — keep only the final state per PK.
 	pk := ts.srcSchema.PK
 	if len(pk) == 0 {
-		// No PK — can't merge. Just skip materialization.
 		log.Printf("[materializer] skipping %s: no primary key", pgTable)
 		return nil
 	}
 
-	// Compute final state per PK from events by folding incrementally.
-	// This ensures TOAST unchanged columns are resolved from the prior
-	// accumulated state (e.g. INSERT → UPDATE chain within the same batch).
-	type pkState struct {
-		op            string
-		row           map[string]any
-		unchangedCols []string // only set when no prior state to resolve from
-	}
-	finalState := make(map[string]*pkState)
-
-	for _, ev := range events {
-		pkKey := buildPKKey(ev.row, pk)
-		existing := finalState[pkKey]
-
-		switch ev.op {
-		case "I":
-			finalState[pkKey] = &pkState{op: "I", row: ev.row}
-		case "U":
-			if existing != nil && len(ev.unchangedCols) > 0 {
-				// Resolve unchanged columns from the accumulated state.
-				merged := make(map[string]any, len(ev.row))
-				for k, v := range ev.row {
-					merged[k] = v
-				}
-				for _, col := range ev.unchangedCols {
-					if val, ok := existing.row[col]; ok {
-						merged[col] = val
-					}
-				}
-				finalState[pkKey] = &pkState{op: "U", row: merged}
-			} else {
-				// No prior state in this batch — carry unchangedCols.
-				// For MoR, unchanged cols remain nil in the new data file.
-				// The equality delete removes the old row, and the new data
-				// file has the complete row (minus TOAST cols that stay nil).
-				finalState[pkKey] = &pkState{
-					op:            "U",
-					row:           ev.row,
-					unchangedCols: ev.unchangedCols,
-				}
-			}
-		case "D":
-			finalState[pkKey] = &pkState{op: "D", row: ev.row}
-		}
-	}
-
-	// Load the materialized table metadata.
+	// Load the materialized table metadata (needed for TOAST + commit).
 	matTm, err := catalog.LoadTable(ns, ts.icebergName)
 	if err != nil {
 		return fmt.Errorf("load materialized table: %w", err)
-	}
-
-	// --- TOAST resolution via file index ---
-	// Check if any UPDATEs have unresolved unchanged columns (TOAST).
-	var unresolvedPKs []string
-	for pkKey, state := range finalState {
-		if state.op == "U" && len(state.unchangedCols) > 0 {
-			unresolvedPKs = append(unresolvedPKs, pkKey)
-		}
-	}
-	if len(unresolvedPKs) > 0 && matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
-		// Ensure we have a file index for this table.
-		fi := m.fileIndexes[pgTable]
-		if fi == nil || fi.snapshotID != matTm.Metadata.CurrentSnapshotID {
-			fi, err = m.buildFileIndex(ctx, pgTable, ts, matTm)
-			if err != nil {
-				return fmt.Errorf("build file index: %w", err)
-			}
-			m.fileIndexes[pgTable] = fi
-		}
-
-		// Find which files contain the unresolved PKs.
-		affectedFilePaths := fi.affectedFiles(unresolvedPKs)
-
-		// Download affected files and resolve TOAST columns.
-		resolved := 0
-		for path := range affectedFilePaths {
-			dfKey, err := KeyFromURI(path)
-			if err != nil {
-				continue
-			}
-			data, err := s3.Download(ctx, dfKey)
-			if err != nil {
-				log.Printf("[materializer] TOAST: failed to download %s: %v", path, err)
-				continue
-			}
-			rows, err := readParquetRows(data, ts.srcSchema)
-			if err != nil {
-				log.Printf("[materializer] TOAST: failed to read %s: %v", path, err)
-				continue
-			}
-
-			for _, row := range rows {
-				pkKey := buildPKKey(row, pk)
-				state, ok := finalState[pkKey]
-				if !ok || state.op != "U" || len(state.unchangedCols) == 0 {
-					continue
-				}
-				// Patch unchanged columns from the existing row.
-				for _, col := range state.unchangedCols {
-					if val, exists := row[col]; exists {
-						state.row[col] = val
-					}
-				}
-				state.unchangedCols = nil // mark as resolved
-				resolved++
-			}
-		}
-		if resolved > 0 {
-			log.Printf("[materializer] TOAST: resolved %d/%d rows for %s (%d files scanned)",
-				resolved, len(unresolvedPKs), pgTable, len(affectedFilePaths))
-		}
 	}
 
 	var prevMatSnapID int64
@@ -384,168 +282,348 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	basePath := fmt.Sprintf("%s.db/%s", ns, ts.icebergName)
 	targetSize := m.cfg.MaterializerTargetFileSizeOrDefault()
 	pkFieldIDs := ts.srcSchema.PKFieldIDs()
+	partitioned := ts.partSpec != nil && !ts.partSpec.IsUnpartitioned()
 
-	// --- Phase 1: Write equality delete files ---
-	// For every PK where the final state is UPDATE or DELETE, write a delete
-	// row containing only PK column values. These logically remove the old row
-	// from existing data files at read time.
-	var deleteEntries []ManifestEntry
-	var deleteRowCount int64
-
-	deleteWriter := NewRollingDeleteWriter(ts.srcSchema, targetSize)
-	for _, state := range finalState {
-		if state.op == "U" || state.op == "D" {
-			// Delete writer only writes PK columns.
-			if err := deleteWriter.Add(state.row); err != nil {
-				return fmt.Errorf("add delete row: %w", err)
-			}
-			deleteRowCount++
-		}
+	// --- Bucket events by partition key (or PK hash for unpartitioned) ---
+	// Each bucket is independent so fold + serialize can run in parallel.
+	type eventBucket struct {
+		key        string
+		events     []changeEvent
+		partValues map[string]any
+		partPath   string
 	}
 
-	if deleteRowCount > 0 {
-		chunks, err := deleteWriter.FlushAll()
-		if err != nil {
-			return fmt.Errorf("flush deletes: %w", err)
+	bucketMap := make(map[string]*eventBucket)
+	numShards := runtime.NumCPU()
+	if numShards < 2 {
+		numShards = 2
+	}
+	for i := range events {
+		ev := &events[i]
+		var bKey string
+		if partitioned {
+			bKey = ts.partSpec.PartitionKey(ev.row, ts.srcSchema)
+		} else {
+			pkKey := buildPKKey(ev.row, pk)
+			var h uint32
+			for j := 0; j < len(pkKey); j++ {
+				h = h*31 + uint32(pkKey[j])
+			}
+			bKey = strconv.Itoa(int(h % uint32(numShards)))
 		}
-		for i, chunk := range chunks {
-			fileUUID := uuid.New().String()
-			key := fmt.Sprintf("%s/data/%s-eq-delete-%d.parquet", basePath, fileUUID, i)
-			uri, err := s3.Upload(ctx, key, chunk.Data)
+		b, ok := bucketMap[bKey]
+		if !ok {
+			b = &eventBucket{key: bKey}
+			if partitioned {
+				b.partValues = ts.partSpec.PartitionValues(ev.row, ts.srcSchema)
+				b.partPath = ts.partSpec.PartitionPath(b.partValues)
+			}
+			bucketMap[bKey] = b
+		}
+		b.events = append(b.events, *ev)
+	}
+
+	buckets := make([]*eventBucket, 0, len(bucketMap))
+	for _, b := range bucketMap {
+		buckets = append(buckets, b)
+	}
+
+	// --- Parallel fold + serialize per bucket ---
+	type pkState struct {
+		op            string
+		row           map[string]any
+		unchangedCols []string
+	}
+	type pendingFile struct {
+		key              string
+		chunk            FileChunk
+		content          int // 0=data, 2=equality delete
+		equalityFieldIDs []int
+		partitionValues  map[string]any
+	}
+	type bucketResult struct {
+		pending        []pendingFile
+		deleteRowCount int64
+		finalState     map[string]*pkState // needed for TOAST resolution
+	}
+
+	// File index for TOAST resolution (built once, shared read-only across buckets).
+	var fi *fileIndex
+	if matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
+		fi = m.fileIndexes[pgTable]
+		if fi == nil || fi.snapshotID != matTm.Metadata.CurrentSnapshotID {
+			fi, err = m.buildFileIndex(ctx, pgTable, ts, matTm)
 			if err != nil {
-				return fmt.Errorf("upload delete file: %w", err)
+				return fmt.Errorf("build file index: %w", err)
 			}
-			deleteEntries = append(deleteEntries, ManifestEntry{
-				Status:     1, // added
-				SnapshotID: snapshotID,
-				DataFile: DataFileInfo{
-					Path:             uri,
-					FileSizeBytes:    int64(len(chunk.Data)),
-					RecordCount:      chunk.RowCount,
-					Content:          2, // equality deletes
-					EqualityFieldIDs: pkFieldIDs,
-				},
-			})
+			m.fileIndexes[pgTable] = fi
 		}
 	}
 
-	// --- Phase 2: Write new data files ---
-	// For every PK where the final state is INSERT or UPDATE, write the
-	// complete row to a new data file.
+	bucketResults := make([]bucketResult, len(buckets))
+
+	bucketTasks := make([]worker.Task, len(buckets))
+	for i, b := range buckets {
+		i, b := i, b
+		bucketTasks[i] = worker.Task{
+			Name: b.key,
+			Fn: func(ctx context.Context, _ *worker.Progress) error {
+				// Fold events into final state per PK.
+				state := make(map[string]*pkState, len(b.events)/2)
+				for _, ev := range b.events {
+					pkKey := buildPKKey(ev.row, pk)
+					existing := state[pkKey]
+
+					switch ev.op {
+					case "I":
+						state[pkKey] = &pkState{op: "I", row: ev.row}
+					case "U":
+						if existing != nil && len(ev.unchangedCols) > 0 {
+							merged := make(map[string]any, len(ev.row))
+							for k, v := range ev.row {
+								merged[k] = v
+							}
+							for _, col := range ev.unchangedCols {
+								if val, ok := existing.row[col]; ok {
+									merged[col] = val
+								}
+							}
+							state[pkKey] = &pkState{op: "U", row: merged}
+						} else {
+							state[pkKey] = &pkState{
+								op:            "U",
+								row:           ev.row,
+								unchangedCols: ev.unchangedCols,
+							}
+						}
+					case "D":
+						state[pkKey] = &pkState{op: "D", row: ev.row}
+					}
+				}
+				bucketResults[i].finalState = state
+
+				// Serialize equality delete files.
+				var deleteRowCount int64
+				deleteWriter := NewRollingDeleteWriter(ts.srcSchema, targetSize)
+				for _, s := range state {
+					if s.op == "U" || s.op == "D" {
+						if err := deleteWriter.Add(s.row); err != nil {
+							return fmt.Errorf("add delete row: %w", err)
+						}
+						deleteRowCount++
+					}
+				}
+				var pf []pendingFile
+				if deleteRowCount > 0 {
+					chunks, err := deleteWriter.FlushAll()
+					if err != nil {
+						return fmt.Errorf("flush deletes: %w", err)
+					}
+					for j, chunk := range chunks {
+						key := fmt.Sprintf("%s/data/%s-eq-delete-%d.parquet", basePath, uuid.New().String(), j)
+						pf = append(pf, pendingFile{
+							key:              key,
+							chunk:            chunk,
+							content:          2,
+							equalityFieldIDs: pkFieldIDs,
+						})
+					}
+				}
+
+				// Serialize data files.
+				dataWriter := NewRollingDataWriter(ts.srcSchema, targetSize)
+				for _, s := range state {
+					if s.op == "I" || s.op == "U" {
+						if err := dataWriter.Add(s.row); err != nil {
+							return fmt.Errorf("add data row: %w", err)
+						}
+					}
+				}
+				chunks, err := dataWriter.FlushAll()
+				if err != nil {
+					return fmt.Errorf("flush data: %w", err)
+				}
+				if partitioned {
+					avroPartValues := ts.partSpec.PartitionAvroValue(b.partValues, ts.srcSchema)
+					for j, chunk := range chunks {
+						key := fmt.Sprintf("%s/data/%s/%s-mat-%d.parquet", basePath, b.partPath, uuid.New().String(), j)
+						pf = append(pf, pendingFile{
+							key:             key,
+							chunk:           chunk,
+							content:         0,
+							partitionValues: avroPartValues,
+						})
+					}
+				} else {
+					for j, chunk := range chunks {
+						key := fmt.Sprintf("%s/data/%s-mat-%d.parquet", basePath, uuid.New().String(), j)
+						pf = append(pf, pendingFile{key: key, chunk: chunk, content: 0})
+					}
+				}
+
+				bucketResults[i].pending = pf
+				bucketResults[i].deleteRowCount = deleteRowCount
+				return nil
+			},
+		}
+	}
+
+	foldConcurrency := runtime.NumCPU()
+	if len(bucketTasks) < foldConcurrency {
+		foldConcurrency = len(bucketTasks)
+	}
+	if foldConcurrency < 1 {
+		foldConcurrency = 1
+	}
+	bucketPool := worker.NewPool(foldConcurrency)
+	if _, err := bucketPool.Run(ctx, bucketTasks); err != nil {
+		return fmt.Errorf("fold+serialize: %w", err)
+	}
+
+	tFold := time.Since(start)
+
+	// Collect results from all buckets.
+	var pending []pendingFile
+	var deleteRowCount int64
+	var allUnresolvedPKs []string
+	allFinalState := make(map[string]*pkState)
+
+	for _, r := range bucketResults {
+		pending = append(pending, r.pending...)
+		deleteRowCount += r.deleteRowCount
+		for k, v := range r.finalState {
+			if v.op == "U" && len(v.unchangedCols) > 0 {
+				allUnresolvedPKs = append(allUnresolvedPKs, k)
+			}
+			allFinalState[k] = v
+		}
+	}
+
+	// TOAST resolution: download affected files for unresolved PKs.
+	if len(allUnresolvedPKs) > 0 && fi != nil {
+		affectedFilePaths := fi.affectedFiles(allUnresolvedPKs)
+		resolved := 0
+		for path := range affectedFilePaths {
+			dfKey, err := KeyFromURI(path)
+			if err != nil {
+				continue
+			}
+			data, err := s3.Download(ctx, dfKey)
+			if err != nil {
+				log.Printf("[materializer] TOAST: failed to download %s: %v", path, err)
+				continue
+			}
+			rows, err := readParquetRows(data, ts.srcSchema)
+			if err != nil {
+				log.Printf("[materializer] TOAST: failed to read %s: %v", path, err)
+				continue
+			}
+			for _, row := range rows {
+				pkKey := buildPKKey(row, pk)
+				state, ok := allFinalState[pkKey]
+				if !ok || state.op != "U" || len(state.unchangedCols) == 0 {
+					continue
+				}
+				for _, col := range state.unchangedCols {
+					if val, exists := row[col]; exists {
+						state.row[col] = val
+					}
+				}
+				state.unchangedCols = nil
+				resolved++
+			}
+		}
+		if resolved > 0 {
+			log.Printf("[materializer] TOAST: resolved %d/%d rows for %s (%d files scanned)",
+				resolved, len(allUnresolvedPKs), pgTable, len(affectedFilePaths))
+		}
+	}
+
+	tToast := time.Since(start)
+	tSerialize := tToast // fold+serialize ran together in parallel
+
+	// --- Phase 2: Upload all files in parallel (I/O-bound) ---
+	var deleteEntries []ManifestEntry
 	var dataEntries []ManifestEntry
 
-	if ts.partSpec == nil || ts.partSpec.IsUnpartitioned() {
-		writer := NewRollingDataWriter(ts.srcSchema, targetSize)
-		for _, state := range finalState {
-			if state.op == "I" || state.op == "U" {
-				if err := writer.Add(state.row); err != nil {
-					return fmt.Errorf("add data row: %w", err)
-				}
+	if len(pending) > 0 {
+		type uploadedFile struct {
+			uri string
+			pf  pendingFile
+		}
+
+		var mu sync.Mutex
+		var uploaded []uploadedFile
+
+		tasks := make([]worker.Task, len(pending))
+		for i, pf := range pending {
+			pf := pf
+			tasks[i] = worker.Task{
+				Name: pf.key,
+				Fn: func(ctx context.Context, _ *worker.Progress) error {
+					uri, err := s3.Upload(ctx, pf.key, pf.chunk.Data)
+					if err != nil {
+						return fmt.Errorf("upload %s: %w", pf.key, err)
+					}
+					mu.Lock()
+					uploaded = append(uploaded, uploadedFile{uri: uri, pf: pf})
+					mu.Unlock()
+					return nil
+				},
 			}
 		}
-		chunks, err := writer.FlushAll()
-		if err != nil {
-			return fmt.Errorf("flush data: %w", err)
+
+		concurrency := m.cfg.MaterializerConcurrencyOrDefault()
+		if len(tasks) < concurrency {
+			concurrency = len(tasks)
 		}
-		for i, chunk := range chunks {
-			fileUUID := uuid.New().String()
-			key := fmt.Sprintf("%s/data/%s-mat-%d.parquet", basePath, fileUUID, i)
-			uri, err := s3.Upload(ctx, key, chunk.Data)
-			if err != nil {
-				return fmt.Errorf("upload data file: %w", err)
-			}
-			dataEntries = append(dataEntries, ManifestEntry{
+		pool := worker.NewPool(concurrency)
+		if _, err := pool.Run(ctx, tasks); err != nil {
+			return fmt.Errorf("upload materialized files: %w", err)
+		}
+
+		for _, u := range uploaded {
+			entry := ManifestEntry{
 				Status:     1,
 				SnapshotID: snapshotID,
 				DataFile: DataFileInfo{
-					Path:          uri,
-					FileSizeBytes: int64(len(chunk.Data)),
-					RecordCount:   chunk.RowCount,
-					Content:       0, // data
+					Path:             u.uri,
+					FileSizeBytes:    int64(len(u.pf.chunk.Data)),
+					RecordCount:      u.pf.chunk.RowCount,
+					Content:          u.pf.content,
+					EqualityFieldIDs: u.pf.equalityFieldIDs,
+					PartitionValues:  u.pf.partitionValues,
 				},
-			})
-		}
-	} else {
-		// Partitioned: group rows by partition, write per-partition files.
-		type partBucket struct {
-			values map[string]any
-			rows   []map[string]any
-		}
-		partitions := make(map[string]*partBucket)
-
-		for _, state := range finalState {
-			if state.op == "I" || state.op == "U" {
-				pKey := ts.partSpec.PartitionKey(state.row, ts.srcSchema)
-				pb, ok := partitions[pKey]
-				if !ok {
-					pb = &partBucket{
-						values: ts.partSpec.PartitionValues(state.row, ts.srcSchema),
-					}
-					partitions[pKey] = pb
-				}
-				pb.rows = append(pb.rows, state.row)
 			}
-		}
-
-		for _, pb := range partitions {
-			writer := NewRollingDataWriter(ts.srcSchema, targetSize)
-			for _, row := range pb.rows {
-				if err := writer.Add(row); err != nil {
-					return fmt.Errorf("add row: %w", err)
-				}
-			}
-			chunks, err := writer.FlushAll()
-			if err != nil {
-				return fmt.Errorf("flush partition: %w", err)
-			}
-
-			partPath := ts.partSpec.PartitionPath(pb.values)
-			avroPartValues := ts.partSpec.PartitionAvroValue(pb.values, ts.srcSchema)
-
-			for i, chunk := range chunks {
-				fileUUID := uuid.New().String()
-				key := fmt.Sprintf("%s/data/%s/%s-mat-%d.parquet", basePath, partPath, fileUUID, i)
-				uri, err := s3.Upload(ctx, key, chunk.Data)
-				if err != nil {
-					return fmt.Errorf("upload data file: %w", err)
-				}
-				dataEntries = append(dataEntries, ManifestEntry{
-					Status:     1,
-					SnapshotID: snapshotID,
-					DataFile: DataFileInfo{
-						Path:            uri,
-						FileSizeBytes:   int64(len(chunk.Data)),
-						RecordCount:     chunk.RowCount,
-						Content:         0,
-						PartitionValues: avroPartValues,
-					},
-				})
+			if u.pf.content == 0 {
+				dataEntries = append(dataEntries, entry)
+			} else {
+				deleteEntries = append(deleteEntries, entry)
 			}
 		}
 	}
 
+	tUpload := time.Since(start)
+
 	// Nothing to commit if no deletes and no data.
 	if len(deleteEntries) == 0 && len(dataEntries) == 0 {
-		if fromBuffer {
-			eventsTm, err := catalog.LoadTable(ns, ts.eventsIcebergName)
-			if err == nil && eventsTm != nil {
-				m.lastEventsSnapshot[pgTable] = eventsTm.Metadata.CurrentSnapshotID
-			}
+		if fromBuffer && bufSnapID > 0 {
+			m.lastEventsSnapshot[pgTable] = bufSnapID
 		}
 		return nil
 	}
 
 	// --- Phase 3: Carry forward existing manifests and commit ---
-	// Load existing manifests from the previous snapshot's manifest list.
-	// These are included unchanged in the new manifest list.
-	var existingManifests []ManifestFileInfo
-	if matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
+	// Use cached manifests from previous cycle. On first run (cache empty),
+	// load from S3 if a manifest list exists (crash recovery).
+	if ts.matManifests == nil && matTm != nil && matTm.Metadata.CurrentSnapshotID > 0 {
 		var err error
-		existingManifests, err = m.loadExistingManifests(ctx, s3, matTm)
+		ts.matManifests, err = m.loadExistingManifests(ctx, s3, matTm)
 		if err != nil {
 			return fmt.Errorf("load existing manifests: %w", err)
 		}
 	}
+	existingManifests := ts.matManifests
 
 	var newManifests []ManifestFileInfo
 
@@ -597,8 +675,9 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 		})
 	}
 
-	// Manifest list = existing manifests + new manifests.
+	// Manifest list = existing manifests + new manifests. Cache for next cycle.
 	allManifests := append(existingManifests, newManifests...)
+	ts.matManifests = allManifests
 
 	mlBytes, err := WriteManifestList(allManifests)
 	if err != nil {
@@ -625,6 +704,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	if err := catalog.CommitSnapshot(ns, ts.icebergName, prevMatSnapID, commit); err != nil {
 		return fmt.Errorf("commit materialized snapshot: %w", err)
 	}
+	tCommit := time.Since(start)
 
 	// Invalidate the file index so it's rebuilt on next TOAST resolution.
 	// MoR doesn't rewrite files, but equality deletes logically remove old rows.
@@ -634,11 +714,8 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	}
 
 	// Update checkpoint for in-memory path (S3 path already updated above).
-	if fromBuffer {
-		eventsTm, err := catalog.LoadTable(ns, ts.eventsIcebergName)
-		if err == nil && eventsTm != nil {
-			m.lastEventsSnapshot[pgTable] = eventsTm.Metadata.CurrentSnapshotID
-		}
+	if fromBuffer && bufSnapID > 0 {
+		m.lastEventsSnapshot[pgTable] = bufSnapID
 	}
 
 	source := "buffer"
@@ -665,8 +742,11 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 	metrics.MaterializerDeleteFilesWrittenTotal.WithLabelValues(pgTable).Add(float64(len(deleteEntries)))
 	metrics.MaterializerDeleteRowsTotal.WithLabelValues(pgTable).Add(float64(deleteRowCount))
 
-	log.Printf("[materializer] materialized %s: %d events (%s), %d data files, %d delete files (%.1fs)",
-		pgTable, len(events), source, len(dataEntries), len(deleteEntries), duration.Seconds())
+	log.Printf("[materializer] materialized %s: %d events (%s), %d buckets, %d data files, %d delete files (%.1fs) [drain=%.0fms fold=%.0fms toast=%.0fms upload=%.0fms commit=%.0fms]",
+		pgTable, len(events), source, len(buckets), len(dataEntries), len(deleteEntries), duration.Seconds(),
+		float64(tDrain.Milliseconds()), float64((tFold-tDrain).Milliseconds()),
+		float64((tToast-tFold).Milliseconds()),
+		float64((tUpload-tSerialize).Milliseconds()), float64((tCommit-tUpload).Milliseconds()))
 
 	return nil
 }
@@ -1052,14 +1132,36 @@ func readParquetPKKeysFromReaderAt(r io.ReaderAt, size int64, pk []string) ([]st
 // Uses null byte as separator to avoid collisions.
 func buildPKKey(row map[string]any, pk []string) string {
 	if len(pk) == 1 {
-		return fmt.Sprintf("%v", row[pk[0]])
+		return anyToString(row[pk[0]])
 	}
 	var b strings.Builder
 	for i, col := range pk {
 		if i > 0 {
 			b.WriteByte(0)
 		}
-		fmt.Fprintf(&b, "%v", row[col])
+		b.WriteString(anyToString(row[col]))
 	}
 	return b.String()
+}
+
+// anyToString converts a value to string without reflection for common PK types.
+func anyToString(v any) string {
+	switch x := v.(type) {
+	case string:
+		return x
+	case int64:
+		return strconv.FormatInt(x, 10)
+	case int32:
+		return strconv.FormatInt(int64(x), 10)
+	case int:
+		return strconv.Itoa(x)
+	case float64:
+		return strconv.FormatFloat(x, 'f', -1, 64)
+	case []byte:
+		return string(x)
+	case nil:
+		return ""
+	default:
+		return fmt.Sprintf("%v", v)
+	}
 }

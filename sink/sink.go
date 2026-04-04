@@ -30,7 +30,7 @@ type txBuffer struct {
 // EventBuffer receives change events from the sink after a successful flush.
 // Used to pass events to downstream consumers without S3 round-trips.
 type EventBuffer interface {
-	PushEvents(pgTable string, events []changeEvent)
+	PushEvents(pgTable string, events []changeEvent, snapshotID int64)
 }
 
 // Sink buffers ChangeEvents and periodically flushes them to Iceberg.
@@ -89,6 +89,10 @@ type tableSink struct {
 	// Per-partition writers for the events table, keyed by partition key string ("" for unpartitioned).
 	partitions map[string]*partitionedWriter
 	totalRows  int
+
+	// Cached manifest lists to avoid re-downloading from S3 every flush/materialize cycle.
+	eventsManifests []ManifestFileInfo // events table manifests
+	matManifests    []ManifestFileInfo // materialized table manifests
 }
 
 // BuildSink creates a fully-wired Sink from config, constructing the default
@@ -370,45 +374,31 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 		return fmt.Errorf("unregistered table: %s", event.Table)
 	}
 
-	// Build the event row: metadata columns + user columns.
-	row := make(map[string]any, len(ts.eventsSchema.Columns))
-	row["_lsn"] = int64(event.LSN)
-	row["_ts"] = event.SourceTimestamp
-	row["_seq"] = s.seqCounter
-	s.seqCounter++
-
+	// Reuse the source event's map directly — the source allocates a new map
+	// per event and doesn't retain references. Add metadata columns in-place
+	// to avoid a per-row map allocation.
+	var row map[string]any
 	switch event.Operation {
 	case source.OpInsert:
+		row = event.After
 		row["_op"] = "I"
-		// Copy all user columns from After.
-		if event.After != nil {
-			for _, col := range ts.srcSchema.Columns {
-				row[col.Name] = event.After[col.Name]
-			}
-		}
 	case source.OpUpdate:
+		row = event.After
 		row["_op"] = "U"
-		// Copy user columns from After. Unchanged TOAST cols will be nil.
-		if event.After != nil {
-			for _, col := range ts.srcSchema.Columns {
-				row[col.Name] = event.After[col.Name]
-			}
-		}
-		// Record which columns are unchanged (TOAST sentinel).
 		if len(event.UnchangedCols) > 0 {
 			row["_unchanged_cols"] = unchangedColsString(event.UnchangedCols)
 		}
 	case source.OpDelete:
+		row = event.Before
 		row["_op"] = "D"
-		// Only PK columns from Before.
-		if event.Before != nil {
-			for _, col := range ts.srcSchema.Columns {
-				row[col.Name] = event.Before[col.Name]
-			}
-		}
 	default:
 		return nil // ignore other operations
 	}
+
+	row["_lsn"] = int64(event.LSN)
+	row["_ts"] = event.SourceTimestamp
+	row["_seq"] = s.seqCounter
+	s.seqCounter++
 
 	pw := ts.getEventsWriter()
 	if err := pw.dataWriter.Add(row); err != nil {
@@ -419,38 +409,27 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 }
 
 // toChangeEvent converts a source.ChangeEvent into a materializer changeEvent,
-// using the given seq value. This avoids the parquet serialize/deserialize round-trip.
+// using the given seq value. Reuses the source event's map directly — the source
+// allocates a fresh map per event so no copy is needed. The map is shared with
+// writeDirect (which adds metadata keys like _lsn, _op); the materializer only
+// accesses user columns by name so the extra keys are harmless.
 func (s *Sink) toChangeEvent(event source.ChangeEvent, seq int64) changeEvent {
-	ts := s.tables[event.Table]
 	ce := changeEvent{
 		lsn:           int64(event.LSN),
 		seq:           seq,
 		unchangedCols: event.UnchangedCols,
-		row:           make(map[string]any, len(ts.srcSchema.Columns)),
 	}
 
 	switch event.Operation {
 	case source.OpInsert:
 		ce.op = "I"
-		if event.After != nil {
-			for _, col := range ts.srcSchema.Columns {
-				ce.row[col.Name] = event.After[col.Name]
-			}
-		}
+		ce.row = event.After
 	case source.OpUpdate:
 		ce.op = "U"
-		if event.After != nil {
-			for _, col := range ts.srcSchema.Columns {
-				ce.row[col.Name] = event.After[col.Name]
-			}
-		}
+		ce.row = event.After
 	case source.OpDelete:
 		ce.op = "D"
-		if event.Before != nil {
-			for _, col := range ts.srcSchema.Columns {
-				ce.row[col.Name] = event.Before[col.Name]
-			}
-		}
+		ce.row = event.Before
 	}
 	return ce
 }
@@ -539,14 +518,15 @@ func (s *Sink) Flush(ctx context.Context) error {
 	}
 
 	// Flush all tables: parallel S3 uploads + single atomic catalog commit.
-	if _, err := s.flushAllTables(ctx); err != nil {
+	snapshotIDs, err := s.flushAllTables(ctx)
+	if err != nil {
 		return err
 	}
 
 	// Push events to materializer buffer only after successful S3 commit.
 	if s.eventBuf != nil {
 		for pgTable, events := range bufferedEvents {
-			s.eventBuf.PushEvents(pgTable, events)
+			s.eventBuf.PushEvents(pgTable, events, snapshotIDs[pgTable])
 		}
 	}
 
@@ -752,22 +732,26 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 	}
 
 	seqNum := tm.Metadata.LastSequenceNumber + 1
-	var existingManifests []ManifestFileInfo
 
-	if ml := tm.CurrentManifestList(); ml != "" {
-		mlKey, err := KeyFromURI(ml)
-		if err != nil {
-			return nil, fmt.Errorf("parse manifest list URI: %w", err)
-		}
-		mlData, err := s.s3.Download(ctx, mlKey)
-		if err != nil {
-			return nil, fmt.Errorf("download manifest list: %w", err)
-		}
-		existingManifests, err = ReadManifestList(mlData)
-		if err != nil {
-			return nil, fmt.Errorf("read manifest list: %w", err)
+	// Use cached manifests from previous cycle instead of re-downloading from S3.
+	// On first flush (cache empty), load from S3 if a manifest list exists.
+	if ts.eventsManifests == nil {
+		if ml := tm.CurrentManifestList(); ml != "" {
+			mlKey, err := KeyFromURI(ml)
+			if err != nil {
+				return nil, fmt.Errorf("parse manifest list URI: %w", err)
+			}
+			mlData, err := s.s3.Download(ctx, mlKey)
+			if err != nil {
+				return nil, fmt.Errorf("download manifest list: %w", err)
+			}
+			ts.eventsManifests, err = ReadManifestList(mlData)
+			if err != nil {
+				return nil, fmt.Errorf("read manifest list: %w", err)
+			}
 		}
 	}
+	existingManifests := ts.eventsManifests
 
 	// Write data manifest.
 	var manifestInfos []ManifestFileInfo
@@ -807,8 +791,9 @@ func (s *Sink) assembleEventsCommit(ctx context.Context, pgTable string, ts *tab
 		})
 	}
 
-	// Write manifest list (existing + new).
+	// Write manifest list (existing + new) and cache for next cycle.
 	allManifests := append(existingManifests, manifestInfos...)
+	ts.eventsManifests = allManifests
 	mlBytes, err := WriteManifestList(allManifests)
 	if err != nil {
 		return nil, fmt.Errorf("write manifest list: %w", err)
