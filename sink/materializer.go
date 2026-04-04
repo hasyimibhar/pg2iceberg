@@ -17,6 +17,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/pg2iceberg/pg2iceberg/worker"
 )
 
@@ -130,6 +131,17 @@ type Materializer struct {
 }
 
 // NewMaterializer creates a new Materializer.
+// downloadWithRetry wraps an S3 download with exponential backoff for transient errors.
+func downloadWithRetry(ctx context.Context, s3 ObjectStorage, key string) ([]byte, error) {
+	var data []byte
+	err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
+		var err error
+		data, err = s3.Download(ctx, key)
+		return err
+	})
+	return data, err
+}
+
 func NewMaterializer(cfg config.SinkConfig, catalog Catalog, s3 ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
 	return &Materializer{
 		cfg:                cfg,
@@ -497,7 +509,7 @@ func (m *Materializer) MaterializeTable(ctx context.Context, pgTable string, ts 
 			if err != nil {
 				return fmt.Errorf("TOAST: parse URI %s: %w", path, err)
 			}
-			data, err := s3.Download(ctx, dfKey)
+			data, err := downloadWithRetry(ctx, s3, dfKey)
 			if err != nil {
 				return fmt.Errorf("TOAST: download %s: %w", path, err)
 			}
@@ -847,7 +859,7 @@ func (m *Materializer) loadExistingManifests(ctx context.Context, s3 ObjectStora
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list URI: %w", err)
 	}
-	mlData, err := s3.Download(ctx, mlKey)
+	mlData, err := downloadWithRetry(ctx, s3, mlKey)
 	if err != nil {
 		return nil, fmt.Errorf("download manifest list: %w", err)
 	}
@@ -933,7 +945,7 @@ func (m *Materializer) loadAllDataFiles(ctx context.Context, s3 ObjectStorage, t
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list URI: %w", err)
 	}
-	mlData, err := s3.Download(ctx, mlKey)
+	mlData, err := downloadWithRetry(ctx, s3, mlKey)
 	if err != nil {
 		return nil, fmt.Errorf("download manifest list: %w", err)
 	}
@@ -951,7 +963,7 @@ func (m *Materializer) loadAllDataFiles(ctx context.Context, s3 ObjectStorage, t
 		if err != nil {
 			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
 		}
-		mData, err := s3.Download(ctx, mKey)
+		mData, err := downloadWithRetry(ctx, s3, mKey)
 		if err != nil {
 			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
 		}
@@ -981,7 +993,7 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 	if err != nil {
 		return nil, fmt.Errorf("parse manifest list URI: %w", err)
 	}
-	mlData, err := s3.Download(ctx, mlKey)
+	mlData, err := downloadWithRetry(ctx, s3, mlKey)
 	if err != nil {
 		return nil, fmt.Errorf("download manifest list: %w", err)
 	}
@@ -1004,7 +1016,7 @@ func (m *Materializer) findNewEventFiles(ctx context.Context, s3 ObjectStorage, 
 		if err != nil {
 			return nil, fmt.Errorf("parse manifest URI %s: %w", mfi.Path, err)
 		}
-		mData, err := s3.Download(ctx, mKey)
+		mData, err := downloadWithRetry(ctx, s3, mKey)
 		if err != nil {
 			return nil, fmt.Errorf("download manifest %s: %w", mfi.Path, err)
 		}
@@ -1034,7 +1046,7 @@ func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files [
 		if err != nil {
 			return nil, fmt.Errorf("parse event file URI %s: %w", df.Path, err)
 		}
-		data, err := s3.Download(ctx, key)
+		data, err := downloadWithRetry(ctx, s3, key)
 		if err != nil {
 			return nil, fmt.Errorf("download event file %s: %w", df.Path, err)
 		}

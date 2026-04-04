@@ -13,6 +13,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/sink"
 	"github.com/pg2iceberg/pg2iceberg/source"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 )
 
 // Status represents the current state of a Pipeline.
@@ -433,20 +434,23 @@ func (p *Pipeline) run(ctx context.Context) {
 
 			if p.snk.TotalBuffered() >= flushRows {
 				if err := p.doFlush(ctx); err != nil {
-					log.Printf("[pipeline:%s] flush error (will retry): %v", p.id, err)
+					p.setStatus(StatusError, fmt.Errorf("flush failed after retries: %w", err))
+					return
 				}
 			}
 
 			if p.snk.TotalBufferedBytes() >= flushBytes {
 				if err := p.doFlush(ctx); err != nil {
-					log.Printf("[pipeline:%s] flush error (will retry): %v", p.id, err)
+					p.setStatus(StatusError, fmt.Errorf("flush failed after retries: %w", err))
+					return
 				}
 			}
 
 		case <-flushTicker.C:
 			if p.snk.ShouldFlush() {
 				if err := p.doFlush(ctx); err != nil {
-					log.Printf("[pipeline:%s] flush error (will retry): %v", p.id, err)
+					p.setStatus(StatusError, fmt.Errorf("flush failed after retries: %w", err))
+					return
 				}
 			}
 
@@ -526,7 +530,9 @@ func (p *Pipeline) doFlush(ctx context.Context) error {
 	flushedBytes := p.snk.TotalBufferedBytes()
 
 	start := time.Now()
-	err := p.flush(ctx)
+	err := utils.Do(ctx, 5, 100*time.Millisecond, 10*time.Second, func() error {
+		return p.flush(ctx)
+	})
 	duration := time.Since(start).Seconds()
 
 	metrics.FlushDurationSeconds.WithLabelValues(p.id).Observe(duration)

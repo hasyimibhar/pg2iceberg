@@ -10,6 +10,7 @@ import (
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/schema"
+	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -215,7 +216,9 @@ func (l *LogicalSource) Capture(ctx context.Context, events chan<- ChangeEvent) 
 
 		// Send standby status periodically so PG knows we're alive.
 		if time.Now().After(nextStandby) {
-			if err := l.sendStandby(ctx); err != nil {
+			if err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
+				return l.sendStandby(ctx)
+			}); err != nil {
 				return fmt.Errorf("standby status: %w", err)
 			}
 			nextStandby = time.Now().Add(standbyInterval)
@@ -254,7 +257,9 @@ func (l *LogicalSource) handleCopyData(ctx context.Context, msg *pgproto3.CopyDa
 			return fmt.Errorf("parse keepalive: %w", err)
 		}
 		if pkm.ReplyRequested {
-			if err := l.sendStandby(ctx); err != nil {
+			if err := utils.Do(ctx, 3, 100*time.Millisecond, 5*time.Second, func() error {
+				return l.sendStandby(ctx)
+			}); err != nil {
 				return fmt.Errorf("standby status: %w", err)
 			}
 		}
