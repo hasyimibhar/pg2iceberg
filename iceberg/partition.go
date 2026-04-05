@@ -1,4 +1,4 @@
-package sink
+package iceberg
 
 import (
 	"encoding/base64"
@@ -348,6 +348,22 @@ func (ps *PartitionSpec) ParsePartitionPath(path string, ts *schema.TableSchema)
 	return values
 }
 
+// ExtractPartBucketKey extracts the partition bucket key from a file path.
+// For a path like "ns.db/table/data/region=us/abc.parquet", returns "region=us".
+func ExtractPartBucketKey(filePath string) string {
+	// Find the data/ segment and extract everything between it and the filename.
+	idx := strings.Index(filePath, "/data/")
+	if idx < 0 {
+		return ""
+	}
+	rest := filePath[idx+6:] // after "/data/"
+	lastSlash := strings.LastIndex(rest, "/")
+	if lastSlash < 0 {
+		return "" // no partition directory
+	}
+	return rest[:lastSlash]
+}
+
 // --- helpers ---
 
 func findColumn(ts *schema.TableSchema, name string) *schema.Column {
@@ -411,26 +427,26 @@ func applyTransform(transform string, param int, value any, pgType string) any {
 	case "identity":
 		return value
 	case "year":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
 		return int32(t.Year() - 1970)
 	case "month":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
 		return int32((t.Year()-1970)*12 + int(t.Month()) - 1)
 	case "day":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
 		epoch := time.Date(1970, 1, 1, 0, 0, 0, 0, time.UTC)
 		return int32(t.Sub(epoch).Hours() / 24)
 	case "hour":
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
@@ -463,7 +479,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 
 	switch lowerType {
 	case "integer", "int", "int4", "serial":
-		n, err := toInt32(value)
+		n, err := ToInt32(value)
 		if err != nil {
 			return nil
 		}
@@ -471,7 +487,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		binary.LittleEndian.PutUint32(buf, uint32(n))
 		return buf
 	case "bigint", "int8", "bigserial":
-		n, err := toInt64(value)
+		n, err := ToInt64(value)
 		if err != nil {
 			return nil
 		}
@@ -479,7 +495,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		binary.LittleEndian.PutUint64(buf, uint64(n))
 		return buf
 	case "smallint", "int2":
-		n, err := toInt32(value)
+		n, err := ToInt32(value)
 		if err != nil {
 			return nil
 		}
@@ -488,7 +504,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 		return buf
 	case "date":
 		// Hash as days since epoch (int32 LE).
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
@@ -500,7 +516,7 @@ func valueToHashBytes(value any, pgType string) []byte {
 	case "timestamp", "timestamp without time zone",
 		"timestamptz", "timestamp with time zone":
 		// Hash as microseconds since epoch (int64 LE).
-		t := toTime(value, pgType)
+		t := ToTime(value, pgType)
 		if t.IsZero() {
 			return nil
 		}
@@ -510,26 +526,26 @@ func valueToHashBytes(value any, pgType string) []byte {
 		binary.LittleEndian.PutUint64(buf, uint64(micros))
 		return buf
 	case "text", "varchar", "character varying", "char", "character", "name":
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	case "uuid":
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	case "bytea":
 		if b, ok := value.([]byte); ok {
 			return b
 		}
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	case "numeric", "decimal":
 		return decimalToHashBytes(value)
 	default:
 		// Fall back to string hash.
-		return []byte(toString(value))
+		return []byte(ToString(value))
 	}
 }
 
 // decimalToHashBytes converts a decimal value to its unscaled 2's complement big-endian bytes
 // for Murmur3 hashing per the Iceberg spec.
 func decimalToHashBytes(value any) []byte {
-	s := toString(value)
+	s := ToString(value)
 	// Parse as big.Float to handle arbitrary precision.
 	f, _, err := new(big.Float).Parse(s, 10)
 	if err != nil {
@@ -553,28 +569,28 @@ func applyTruncateTransform(w int, value any, pgType string) any {
 
 	switch lowerType {
 	case "integer", "int", "int4", "serial", "smallint", "int2":
-		v, err := toInt32(value)
+		v, err := ToInt32(value)
 		if err != nil {
 			return value
 		}
 		return truncateInt32(v, int32(w))
 	case "bigint", "int8", "bigserial":
-		v, err := toInt64(value)
+		v, err := ToInt64(value)
 		if err != nil {
 			return value
 		}
 		return truncateInt64(v, int64(w))
 	case "numeric", "decimal":
-		s := toString(value)
+		s := ToString(value)
 		return truncateDecimal(s, w)
 	case "bytea":
 		return truncateBytes(value, w)
 	case "text", "varchar", "character varying", "char", "character", "name":
-		s := toString(value)
+		s := ToString(value)
 		return truncateString(s, w)
 	default:
 		// For other types, fall back to string truncation.
-		s := toString(value)
+		s := ToString(value)
 		return truncateString(s, w)
 	}
 }
@@ -633,7 +649,7 @@ func truncateBytes(value any, w int) string {
 			raw = []byte(v)
 		}
 	default:
-		raw = []byte(toString(value))
+		raw = []byte(ToString(value))
 	}
 
 	if w < len(raw) {
@@ -722,11 +738,11 @@ func formatUnscaled(unscaled *big.Int, scale int) string {
 	return result
 }
 
-// toTime converts a value to time.Time for partition transforms.
-// Uses fastParseTimestamp (microseconds) to avoid time.Parse overhead.
+// ToTime converts a value to time.Time for partition transforms.
+// Uses FastParseTimestamp (microseconds) to avoid time.Parse overhead.
 // Also handles int64 (microseconds since epoch) and int32 (days since epoch)
 // for values roundtripped through parquet.
-func toTime(v any, pgType string) time.Time {
+func ToTime(v any, pgType string) time.Time {
 	switch x := v.(type) {
 	case time.Time:
 		return x
@@ -749,7 +765,7 @@ func toTime(v any, pgType string) time.Time {
 			}
 			return time.Time{}
 		}
-		us, ok := fastParseTimestamp(x)
+		us, ok := FastParseTimestamp(x)
 		if ok {
 			return time.Unix(us/1_000_000, (us%1_000_000)*1000)
 		}
@@ -814,10 +830,10 @@ func goavroUnion(avroType string, val any) map[string]any {
 	case "double":
 		return map[string]any{"double": toAvroFloat64Value(val)}
 	case "boolean":
-		b, _ := toBool(val)
+		b, _ := ToBool(val)
 		return map[string]any{"boolean": b}
 	default:
-		return map[string]any{"string": toString(val)}
+		return map[string]any{"string": ToString(val)}
 	}
 }
 

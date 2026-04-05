@@ -15,6 +15,7 @@ import (
 	"github.com/google/uuid"
 	pq "github.com/parquet-go/parquet-go"
 	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/metrics"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/utils"
@@ -1063,7 +1064,7 @@ func (m *Materializer) buildFileIndex(ctx context.Context, pgTable string, ts *t
 				if err != nil {
 					return fmt.Errorf("stat %s: %w", df.Path, err)
 				}
-				ra := &s3ReaderAt{ctx: ctx, s3: m.s3, key: dfKey}
+				ra := &iceberg.S3ReaderAt{Ctx: ctx, S3: m.s3, Key: dfKey}
 				pkKeys, err := readParquetPKKeysFromReaderAt(ra, size, pk)
 				if err != nil {
 					return fmt.Errorf("read PKs from %s: %w", df.Path, err)
@@ -1212,11 +1213,11 @@ func (m *Materializer) readEvents(ctx context.Context, s3 ObjectStorage, files [
 		}
 
 		for _, row := range rows {
-			lsn, err := toInt64(row["_lsn"])
+			lsn, err := iceberg.ToInt64(row["_lsn"])
 			if err != nil {
 				return nil, fmt.Errorf("parse _lsn in %s: %w", df.Path, err)
 			}
-			seq, err := toInt64(row["_seq"])
+			seq, err := iceberg.ToInt64(row["_seq"])
 			if err != nil {
 				return nil, fmt.Errorf("parse _seq in %s: %w", df.Path, err)
 			}

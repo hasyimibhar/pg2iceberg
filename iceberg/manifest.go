@@ -1,4 +1,4 @@
-package sink
+package iceberg
 
 import (
 	"bytes"
@@ -114,7 +114,7 @@ func WriteManifest(ts *schema.TableSchema, entries []ManifestEntry, seqNum int64
 		return nil, fmt.Errorf("manifest codec: %w", err)
 	}
 
-	icebergSchemaJSON := icebergSchemaJSONString(ts)
+	icebergSchemaJSON := IcebergSchemaJSONString(ts)
 
 	// Build partition-spec metadata JSON.
 	partSpecJSON := "[]"
@@ -327,8 +327,8 @@ func encodeOCF(codec *goavro.Codec, records []any, metadata map[string][]byte) (
 	return b.Bytes(), nil
 }
 
-func icebergSchemaJSONString(ts *schema.TableSchema) string {
-	// Build a JSON string of the Iceberg schema for Avro metadata
+// IcebergSchemaJSONString builds a JSON string of the Iceberg schema for Avro metadata.
+func IcebergSchemaJSONString(ts *schema.TableSchema) string {
 	fields := ""
 	for i, col := range ts.Columns {
 		if i > 0 {
@@ -447,4 +447,3 @@ func toAvroInt32(v any) int32 {
 		return 0
 	}
 }
-

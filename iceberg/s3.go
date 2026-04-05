@@ -1,4 +1,4 @@
-package sink
+package iceberg
 
 import (
 	"bytes"
@@ -122,16 +122,16 @@ func (c *S3Client) StatObject(ctx context.Context, key string) (int64, error) {
 	return *out.ContentLength, nil
 }
 
-// s3ReaderAt implements io.ReaderAt using S3 range reads.
+// S3ReaderAt implements io.ReaderAt using S3 range reads.
 // Used by pq.OpenFile to read only the parquet footer and needed column chunks.
-type s3ReaderAt struct {
-	ctx context.Context
-	s3  ObjectStorage
-	key string
+type S3ReaderAt struct {
+	Ctx context.Context
+	S3  ObjectStorage
+	Key string
 }
 
-func (r *s3ReaderAt) ReadAt(p []byte, off int64) (int, error) {
-	data, err := r.s3.DownloadRange(r.ctx, r.key, off, int64(len(p)))
+func (r *S3ReaderAt) ReadAt(p []byte, off int64) (int, error) {
+	data, err := r.S3.DownloadRange(r.Ctx, r.Key, off, int64(len(p)))
 	if err != nil {
 		return 0, err
 	}

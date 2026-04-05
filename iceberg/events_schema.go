@@ -1,4 +1,4 @@
-package sink
+package iceberg
 
 import (
 	"strings"
@@ -48,8 +48,8 @@ func EventsTableSchema(src *schema.TableSchema) *schema.TableSchema {
 	}
 }
 
-// opString returns the single-character operation code for an event.
-func opString(op string) string {
+// OpString returns the single-character operation code for an event.
+func OpString(op string) string {
 	switch op {
 	case "INSERT":
 		return "I"
@@ -62,9 +62,9 @@ func opString(op string) string {
 	}
 }
 
-// unchangedColsString joins unchanged column names into a comma-separated string.
+// UnchangedColsString joins unchanged column names into a comma-separated string.
 // Returns "" if there are no unchanged columns.
-func unchangedColsString(cols []string) string {
+func UnchangedColsString(cols []string) string {
 	if len(cols) == 0 {
 		return ""
 	}

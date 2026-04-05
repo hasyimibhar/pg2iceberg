@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/pg2iceberg/pg2iceberg/config"
+	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/schema"
 	"github.com/pg2iceberg/pg2iceberg/source"
 	"github.com/pg2iceberg/pg2iceberg/worker"
@@ -400,7 +401,7 @@ func (s *Sink) writeDirect(event source.ChangeEvent) error {
 		row = event.After
 		row["_op"] = "U"
 		if len(event.UnchangedCols) > 0 {
-			row["_unchanged_cols"] = unchangedColsString(event.UnchangedCols)
+			row["_unchanged_cols"] = iceberg.UnchangedColsString(event.UnchangedCols)
 		}
 	case source.OpDelete:
 		row = event.Before
