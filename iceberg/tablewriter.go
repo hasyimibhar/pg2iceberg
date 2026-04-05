@@ -105,6 +105,12 @@ type TableWriter struct {
 	FileIdx *FileIndex
 }
 
+// UpdateSchema updates the writer's schema after a schema evolution.
+func (tw *TableWriter) UpdateSchema(srcSchema *postgres.TableSchema, schemaID int) {
+	tw.cfg.SrcSchema = srcSchema
+	tw.cfg.SchemaID = schemaID
+}
+
 // NewTableWriter creates a new TableWriter.
 func NewTableWriter(cfg TableWriteConfig, catalog Catalog, s3 ObjectStorage) *TableWriter {
 	return &TableWriter{

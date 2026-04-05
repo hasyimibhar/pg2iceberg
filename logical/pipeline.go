@@ -558,6 +558,11 @@ func (p *Pipeline) handleSchemaChange(ctx context.Context, event postgres.Change
 		return fmt.Errorf("evolve schema: %w", err)
 	}
 
+	// Sync the materializer's TableWriter with the evolved schema.
+	if p.materializer != nil {
+		p.materializer.SyncTableWriter(sc.Table)
+	}
+
 	return nil
 }
 

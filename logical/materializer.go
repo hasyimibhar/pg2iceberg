@@ -98,6 +98,19 @@ type Materializer struct {
 	tableWriters map[string]*iceberg.TableWriter
 }
 
+// SyncTableWriter updates the TableWriter's schema after a schema evolution.
+func (m *Materializer) SyncTableWriter(pgTable string) {
+	ts, ok := m.tables[pgTable]
+	if !ok {
+		return
+	}
+	tw, ok := m.tableWriters[pgTable]
+	if !ok {
+		return
+	}
+	tw.UpdateSchema(ts.srcSchema, ts.matSchemaID)
+}
+
 func NewMaterializer(cfg config.SinkConfig, catalog iceberg.Catalog, s3 iceberg.ObjectStorage, tables map[string]*tableSink, buf *ChangeEventBuffer) *Materializer {
 	writers := make(map[string]*iceberg.TableWriter, len(tables))
 	for pgTable, ts := range tables {
