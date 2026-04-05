@@ -1,12 +1,17 @@
-package logical
+// Package snapshot implements CTID-range-chunked initial table snapshots
+// that write directly to materialized Iceberg tables. Shared between logical
+// and query replication modes.
+package snapshot
 
 import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
@@ -21,14 +26,14 @@ import (
 // longer needed (typically closes the underlying connection).
 type TxFactory func(ctx context.Context) (pgx.Tx, func(context.Context), error)
 
-// SnapshotTable describes a table to be snapshotted.
-type SnapshotTable struct {
+// Table describes a table to be snapshotted.
+type Table struct {
 	Name   string
 	Schema *postgres.TableSchema
 }
 
-// SnapshotDeps holds the dependencies needed for direct-to-Iceberg snapshot writes.
-type SnapshotDeps struct {
+// Deps holds the dependencies needed for direct-to-Iceberg snapshot writes.
+type Deps struct {
 	Catalog    iceberg.Catalog
 	S3         iceberg.ObjectStorage
 	SinkCfg    config.SinkConfig
@@ -43,15 +48,15 @@ type SnapshotDeps struct {
 // directly to materialized Iceberg tables. Tables are snapshotted concurrently
 // via a WorkerPool.
 type Snapshotter struct {
-	tables    []SnapshotTable
+	tables    []Table
 	txFactory TxFactory
 	pool      *utils.Pool
-	deps      SnapshotDeps
+	deps      Deps
 }
 
 // NewSnapshotter creates a Snapshotter for the given tables.
 // Concurrency controls how many tables are snapshotted in parallel.
-func NewSnapshotter(tables []SnapshotTable, txFactory TxFactory, concurrency int, deps SnapshotDeps) *Snapshotter {
+func NewSnapshotter(tables []Table, txFactory TxFactory, concurrency int, deps Deps) *Snapshotter {
 	if concurrency <= 0 {
 		concurrency = 1
 	}
@@ -97,7 +102,7 @@ func (s *Snapshotter) Run(ctx context.Context) ([]utils.Result, error) {
 
 // snapshotOneTable copies all rows from a single table using CTID range chunks.
 // Each chunk is: query PG → accumulate rows in memory → commit to Iceberg → checkpoint.
-func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, progress *utils.Progress) error {
+func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl Table, progress *utils.Progress) error {
 	tx, cleanup, err := s.txFactory(ctx)
 	if err != nil {
 		return fmt.Errorf("create tx for %s: %w", tbl.Name, err)
@@ -130,9 +135,8 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, p
 	}
 
 	// Look up the materialized table's Iceberg name and partition spec.
-	icebergName := pgTableToIceberg(tbl.Name)
+	icebergName := postgres.TableToIceberg(tbl.Name)
 	var partSpec *iceberg.PartitionSpec
-	var schemaID int
 	for _, tc := range s.deps.TableCfgs {
 		if tc.Name == tbl.Name {
 			partSpec, err = iceberg.BuildPartitionSpec(tc.Iceberg.Partition, tbl.Schema)
@@ -144,6 +148,7 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, p
 	}
 
 	// Get schema ID from catalog.
+	var schemaID int
 	matTm, err := s.deps.Catalog.LoadTable(s.deps.SinkCfg.Namespace, icebergName)
 	if err != nil {
 		return fmt.Errorf("load materialized table %s: %w", icebergName, err)
@@ -184,7 +189,6 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, p
 		if cp.SnapshotChunks == nil {
 			cp.SnapshotChunks = make(map[string]int)
 		}
-		cp.Mode = "logical"
 		cp.SnapshotChunks[tbl.Name] = chunk.Index
 		if err := s.deps.Store.Save(s.deps.PipelineID, cp); err != nil {
 			return fmt.Errorf("save checkpoint after chunk %d: %w", chunk.Index, err)
@@ -205,7 +209,6 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, p
 	if cp.SnapshotedTables == nil {
 		cp.SnapshotedTables = make(map[string]bool)
 	}
-	cp.Mode = "logical"
 	cp.SnapshotedTables[tbl.Name] = true
 	// Clear chunk progress for this table.
 	delete(cp.SnapshotChunks, tbl.Name)
@@ -219,7 +222,7 @@ func (s *Snapshotter) snapshotOneTable(ctx context.Context, tbl SnapshotTable, p
 
 // snapshotChunk queries a single CTID range, accumulates rows in memory,
 // and commits to Iceberg.
-func (s *Snapshotter) snapshotChunk(ctx context.Context, tx pgx.Tx, tbl SnapshotTable, sw *iceberg.SnapshotWriter, chunk ChunkRange, progress *utils.Progress) (int64, error) {
+func (s *Snapshotter) snapshotChunk(ctx context.Context, tx pgx.Tx, tbl Table, sw *iceberg.SnapshotWriter, chunk ChunkRange, progress *utils.Progress) (int64, error) {
 	query := ChunkQuery(tbl.Name, chunk)
 	rows, err := tx.Query(ctx, query)
 	if err != nil {
@@ -238,7 +241,7 @@ func (s *Snapshotter) snapshotChunk(ctx context.Context, tx pgx.Tx, tbl Snapshot
 
 		row := make(map[string]any, len(descs))
 		for i, desc := range descs {
-			row[string(desc.Name)] = pgValueToString(values[i])
+			row[string(desc.Name)] = PgValueToString(values[i])
 		}
 
 		if err := sw.AddRow(row); err != nil {
@@ -263,4 +266,51 @@ func (s *Snapshotter) snapshotChunk(ctx context.Context, tx pgx.Tx, tbl Snapshot
 	}
 
 	return rowCount, nil
+}
+
+// PgValueToString converts a pgx native Go value to its text representation,
+// matching the format produced by the WAL decoder (which always returns strings).
+func PgValueToString(v any) any {
+	if v == nil {
+		return nil
+	}
+	switch x := v.(type) {
+	case string:
+		return x
+	case int16:
+		return fmt.Sprintf("%d", x)
+	case int32:
+		return fmt.Sprintf("%d", x)
+	case int64:
+		return fmt.Sprintf("%d", x)
+	case float32:
+		return fmt.Sprintf("%g", x)
+	case float64:
+		return fmt.Sprintf("%g", x)
+	case bool:
+		if x {
+			return "t"
+		}
+		return "f"
+	case time.Time:
+		return x.Format("2006-01-02 15:04:05.999999-07")
+	case pgtype.Numeric:
+		if !x.Valid {
+			return nil
+		}
+		intStr := x.Int.String()
+		if x.Exp >= 0 {
+			return intStr + strings.Repeat("0", int(x.Exp))
+		}
+		scale := int(-x.Exp)
+		if len(intStr) <= scale {
+			intStr = strings.Repeat("0", scale-len(intStr)+1) + intStr
+		}
+		pos := len(intStr) - scale
+		return intStr[:pos] + "." + intStr[pos:]
+	case []byte:
+		return string(x)
+	default:
+		return fmt.Sprintf("%v", x)
+	}
 }

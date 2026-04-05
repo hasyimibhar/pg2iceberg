@@ -11,6 +11,7 @@ import (
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/snapshot"
 
 	"github.com/pg2iceberg/pg2iceberg/utils"
 )
@@ -255,7 +256,7 @@ func (p *Pipeline) setup(ctx context.Context) error {
 	p.src.SetSnapshotedTables(cp.SnapshotedTables)
 
 	// Configure direct-to-Iceberg snapshot writes.
-	p.src.SetSnapshotDeps(&SnapshotDeps{
+	p.src.SetSnapshotDeps(&snapshot.Deps{
 		Catalog:    p.snk.Catalog(),
 		S3:         p.snk.S3(),
 		SinkCfg:    p.cfg.Sink,

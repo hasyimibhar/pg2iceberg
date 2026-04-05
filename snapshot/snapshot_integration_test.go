@@ -1,6 +1,6 @@
 //go:build integration
 
-package logical_test
+package snapshot_test
 
 import (
 	"context"
@@ -11,9 +11,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/iceberg"
-	"github.com/pg2iceberg/pg2iceberg/logical"
 	"github.com/pg2iceberg/pg2iceberg/pipeline"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/snapshot"
 )
 
 // TestSnapshotter_DirectWrite snapshots a real PG table with CTID chunking
@@ -88,7 +88,7 @@ func TestSnapshotter_DirectWrite(t *testing.T) {
 		SnapshotTargetFileSize: 1024 * 1024,
 	}
 
-	deps := logical.SnapshotDeps{
+	deps := snapshot.Deps{
 		Catalog:    catalog,
 		S3:         s3,
 		SinkCfg:    sinkCfg,
@@ -99,7 +99,7 @@ func TestSnapshotter_DirectWrite(t *testing.T) {
 		PipelineID: "test",
 	}
 
-	tables := []logical.SnapshotTable{{Name: "public.orders", Schema: ts}}
+	tables := []snapshot.Table{{Name: "public.orders", Schema: ts}}
 
 	dsn := pgCfg.DSN()
 	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
@@ -121,7 +121,7 @@ func TestSnapshotter_DirectWrite(t *testing.T) {
 		return tx, cleanup, nil
 	}
 
-	snap := logical.NewSnapshotter(tables, txFactory, 1, deps)
+	snap := snapshot.NewSnapshotter(tables, txFactory, 1, deps)
 	results, err := snap.Run(ctx)
 	if err != nil {
 		t.Fatalf("snapshot run: %v", err)
@@ -236,7 +236,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 		SnapshotChunkPages: 16, // very small chunks
 	}
 
-	deps := logical.SnapshotDeps{
+	deps := snapshot.Deps{
 		Catalog:    catalog,
 		S3:         s3,
 		SinkCfg:    sinkCfg,
@@ -259,7 +259,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 	tmBefore, _ := catalog.LoadTable(sinkCfg.Namespace, "items")
 	snapshotsBefore := len(tmBefore.Metadata.Snapshots)
 
-	tables := []logical.SnapshotTable{{Name: "public.items", Schema: ts}}
+	tables := []snapshot.Table{{Name: "public.items", Schema: ts}}
 	dsn := pgCfg.DSN()
 	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
 		c, err := pgx.Connect(ctx, dsn)
@@ -280,7 +280,7 @@ func TestSnapshotter_ChunkRecovery(t *testing.T) {
 		return tx, cleanup, nil
 	}
 
-	snap := logical.NewSnapshotter(tables, txFactory, 1, deps)
+	snap := snapshot.NewSnapshotter(tables, txFactory, 1, deps)
 	results, err := snap.Run(ctx)
 	if err != nil {
 		t.Fatalf("snapshot run: %v", err)
@@ -356,7 +356,7 @@ func TestSnapshotter_EmptyTable(t *testing.T) {
 		t.Fatalf("create table: %v", err)
 	}
 
-	deps := logical.SnapshotDeps{
+	deps := snapshot.Deps{
 		Catalog:    catalog,
 		S3:         s3,
 		SinkCfg:    sinkCfg,
@@ -367,7 +367,7 @@ func TestSnapshotter_EmptyTable(t *testing.T) {
 		PipelineID: "test",
 	}
 
-	tables := []logical.SnapshotTable{{Name: "public.empty_tbl", Schema: ts}}
+	tables := []snapshot.Table{{Name: "public.empty_tbl", Schema: ts}}
 	dsn := pgCfg.DSN()
 	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
 		c, err := pgx.Connect(ctx, dsn)
@@ -388,7 +388,7 @@ func TestSnapshotter_EmptyTable(t *testing.T) {
 		return tx, cleanup, nil
 	}
 
-	snap := logical.NewSnapshotter(tables, txFactory, 1, deps)
+	snap := snapshot.NewSnapshotter(tables, txFactory, 1, deps)
 	results, err := snap.Run(ctx)
 	if err != nil {
 		t.Fatalf("snapshot run: %v", err)
@@ -465,7 +465,7 @@ func TestSnapshotter_MultiTable(t *testing.T) {
 	catalog.CreateTable(sinkCfg.Namespace, "t1", ts1, "s3://test-bucket/test_ns.db/t1", nil)
 	catalog.CreateTable(sinkCfg.Namespace, "t2", ts2, "s3://test-bucket/test_ns.db/t2", nil)
 
-	deps := logical.SnapshotDeps{
+	deps := snapshot.Deps{
 		Catalog:    catalog,
 		S3:         s3,
 		SinkCfg:    sinkCfg,
@@ -482,7 +482,7 @@ func TestSnapshotter_MultiTable(t *testing.T) {
 		PipelineID: "test",
 	}
 
-	tables := []logical.SnapshotTable{
+	tables := []snapshot.Table{
 		{Name: "public.t1", Schema: ts1},
 		{Name: "public.t2", Schema: ts2},
 	}
@@ -508,7 +508,7 @@ func TestSnapshotter_MultiTable(t *testing.T) {
 	}
 
 	// Concurrency 2 = both tables in parallel.
-	snap := logical.NewSnapshotter(tables, txFactory, 2, deps)
+	snap := snapshot.NewSnapshotter(tables, txFactory, 2, deps)
 	results, err := snap.Run(ctx)
 	if err != nil {
 		t.Fatalf("snapshot run: %v", err)
@@ -621,7 +621,7 @@ func TestSnapshotter_CTIDChunking(t *testing.T) {
 	// Use very small chunk size to guarantee multiple chunks.
 	// With ~111 pages and chunkPages=8, we get ~14 chunks.
 	const chunkPages = 8
-	deps := logical.SnapshotDeps{
+	deps := snapshot.Deps{
 		Catalog: catalog,
 		S3:      s3,
 		SinkCfg: sinkCfg,
@@ -635,7 +635,7 @@ func TestSnapshotter_CTIDChunking(t *testing.T) {
 		PipelineID: "test",
 	}
 
-	tables := []logical.SnapshotTable{{Name: "public.big_tbl", Schema: ts}}
+	tables := []snapshot.Table{{Name: "public.big_tbl", Schema: ts}}
 	dsn := pgCfg.DSN()
 	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
 		c, err := pgx.Connect(ctx, dsn)
@@ -656,7 +656,7 @@ func TestSnapshotter_CTIDChunking(t *testing.T) {
 		return tx, cleanup, nil
 	}
 
-	snap := logical.NewSnapshotter(tables, txFactory, 1, deps)
+	snap := snapshot.NewSnapshotter(tables, txFactory, 1, deps)
 	results, err := snap.Run(ctx)
 	if err != nil {
 		t.Fatalf("snapshot run: %v", err)

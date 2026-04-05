@@ -10,12 +10,12 @@ import (
 
 	"github.com/pg2iceberg/pg2iceberg/config"
 	"github.com/pg2iceberg/pg2iceberg/postgres"
+	"github.com/pg2iceberg/pg2iceberg/snapshot"
 	"github.com/pg2iceberg/pg2iceberg/utils"
 	"github.com/jackc/pglogrepl"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgproto3"
-	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // LogicalSource implements Source using PostgreSQL logical replication.
@@ -71,7 +71,7 @@ type LogicalSource struct {
 	// snapshotDeps holds dependencies for direct-to-Iceberg snapshot writes.
 	// When set, the snapshot bypasses the events table and writes directly
 	// to materialized tables.
-	snapshotDeps *SnapshotDeps
+	snapshotDeps *snapshot.Deps
 }
 
 func NewLogicalSource(pgCfg config.PostgresConfig, logicalCfg config.LogicalConfig, tableCfgs []config.TableConfig, pipelineID ...string) *LogicalSource {
@@ -115,7 +115,7 @@ func (l *LogicalSource) SetSnapshotedTables(tables map[string]bool) {
 
 // SetSnapshotDeps configures the snapshot to write directly to materialized
 // Iceberg tables, bypassing the events table.
-func (l *LogicalSource) SetSnapshotDeps(deps *SnapshotDeps) {
+func (l *LogicalSource) SetSnapshotDeps(deps *snapshot.Deps) {
 	l.snapshotDeps = deps
 }
 
@@ -496,7 +496,7 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string)
 		return fmt.Errorf("snapshot deps not set; call SetSnapshotDeps before Capture")
 	}
 
-	var tables []SnapshotTable
+	var tables []snapshot.Table
 	for _, tc := range l.tableCfgs {
 		if tc.SkipSnapshot {
 			log.Printf("[logical] snapshot: skipping %s (skip_snapshot=true)", tc.Name)
@@ -506,7 +506,7 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string)
 			log.Printf("[logical] snapshot: skipping %s (already completed)", tc.Name)
 			continue
 		}
-		tables = append(tables, SnapshotTable{
+		tables = append(tables, snapshot.Table{
 			Name:   tc.Name,
 			Schema: l.tables[tc.Name],
 		})
@@ -548,7 +548,7 @@ func (l *LogicalSource) snapshotTables(ctx context.Context, snapshotName string)
 		return tx, cleanup, nil
 	}
 
-	snap := NewSnapshotter(tables, txFactory, l.cfg.SnapshotConcurrencyOrDefault(), *l.snapshotDeps)
+	snap := snapshot.NewSnapshotter(tables, txFactory, l.cfg.SnapshotConcurrencyOrDefault(), *l.snapshotDeps)
 	log.Printf("[logical] snapshot: %d tables, concurrency=%d", len(tables), l.cfg.SnapshotConcurrencyOrDefault())
 	if _, err := snap.Run(ctx); err != nil {
 		return err
@@ -671,54 +671,6 @@ func (l *LogicalSource) schemaForRelation(rel *pglogrepl.RelationMessageV2) *pos
 }
 
 
-// pgValueToString converts a pgx native Go value to its text representation,
-// matching the format produced by the WAL decoder (which always returns strings).
-func pgValueToString(v any) any {
-	if v == nil {
-		return nil
-	}
-	switch x := v.(type) {
-	case string:
-		return x
-	case int16:
-		return fmt.Sprintf("%d", x)
-	case int32:
-		return fmt.Sprintf("%d", x)
-	case int64:
-		return fmt.Sprintf("%d", x)
-	case float32:
-		return fmt.Sprintf("%g", x)
-	case float64:
-		return fmt.Sprintf("%g", x)
-	case bool:
-		if x {
-			return "t"
-		}
-		return "f"
-	case time.Time:
-		return x.Format("2006-01-02 15:04:05.999999-07")
-	case pgtype.Numeric:
-		// Reconstruct the text representation preserving scale (trailing zeros).
-		// Exp is negative for fractional digits: e.g. Int=10050, Exp=-2 → "100.50"
-		if !x.Valid {
-			return nil
-		}
-		intStr := x.Int.String()
-		if x.Exp >= 0 {
-			return intStr + strings.Repeat("0", int(x.Exp))
-		}
-		scale := int(-x.Exp)
-		if len(intStr) <= scale {
-			intStr = strings.Repeat("0", scale-len(intStr)+1) + intStr
-		}
-		pos := len(intStr) - scale
-		return intStr[:pos] + "." + intStr[pos:]
-	case []byte:
-		return string(x)
-	default:
-		return fmt.Sprintf("%v", x)
-	}
-}
 
 func fqTable(namespace, name string) string {
 	if namespace == "" || strings.EqualFold(namespace, "public") {

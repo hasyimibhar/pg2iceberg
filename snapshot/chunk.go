@@ -1,4 +1,4 @@
-package logical
+package snapshot
 
 import (
 	"context"
