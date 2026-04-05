@@ -532,6 +532,182 @@ func TestSnapshotter_MultiTable(t *testing.T) {
 	}
 }
 
+// TestSnapshotter_CTIDChunking verifies that a large table is split into
+// multiple CTID chunks and that all rows are captured with no data loss.
+// This requires ANALYZE to update pg_class.relpages so ComputeChunks produces
+// multiple ranges.
+func TestSnapshotter_CTIDChunking(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping integration test in short mode")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Second)
+	defer cancel()
+
+	pgCfg, cleanup := startPostgres(t, ctx)
+	defer cleanup()
+
+	conn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+
+	// Create table with wide rows to occupy many pages.
+	// A PG page is 8KB. Each row has an int + 500-byte text ≈ ~530 bytes with
+	// overhead, so ~15 rows per page. 500k rows ≈ ~33k pages.
+	_, err = conn.Exec(ctx, `
+		CREATE TABLE public.big_tbl (
+			id   SERIAL PRIMARY KEY,
+			pad  TEXT NOT NULL
+		)`)
+	if err != nil {
+		t.Fatalf("create table: %v", err)
+	}
+
+	const rowCount = 500_000
+	// Bulk insert via generate_series — fast even for large counts.
+	_, err = conn.Exec(ctx, `
+		INSERT INTO big_tbl (pad)
+		SELECT repeat('x', 500)
+		FROM generate_series(1, $1)`, rowCount)
+	if err != nil {
+		t.Fatalf("bulk insert: %v", err)
+	}
+
+	// ANALYZE so pg_class.relpages is up to date.
+	_, err = conn.Exec(ctx, "ANALYZE big_tbl")
+	if err != nil {
+		t.Fatalf("analyze: %v", err)
+	}
+
+	// Verify relpages > 0.
+	var relpages int64
+	err = conn.QueryRow(ctx,
+		"SELECT relpages FROM pg_class WHERE relname = 'big_tbl'").Scan(&relpages)
+	if err != nil {
+		t.Fatalf("query relpages: %v", err)
+	}
+	t.Logf("big_tbl: %d rows, %d pages", rowCount, relpages)
+	if relpages <= 1 {
+		t.Fatalf("expected relpages > 1 after ANALYZE, got %d", relpages)
+	}
+	conn.Close(ctx)
+
+	schemaConn, err := pgx.Connect(ctx, pgCfg.DSN())
+	if err != nil {
+		t.Fatalf("schema connect: %v", err)
+	}
+	ts, err := postgres.DiscoverSchema(ctx, schemaConn, "public.big_tbl")
+	if err != nil {
+		t.Fatalf("discover schema: %v", err)
+	}
+	schemaConn.Close(ctx)
+
+	catalog := newMemCatalog()
+	s3 := newMemStorage()
+	store := pipeline.NewMemCheckpointStore()
+
+	sinkCfg := config.SinkConfig{
+		Namespace: "test_ns",
+		Warehouse: "s3://test-bucket/",
+	}
+
+	_, err = catalog.CreateTable(sinkCfg.Namespace, "big_tbl", ts,
+		fmt.Sprintf("%stest_ns.db/big_tbl", sinkCfg.Warehouse), nil)
+	if err != nil {
+		t.Fatalf("create table in catalog: %v", err)
+	}
+
+	// Use very small chunk size to guarantee multiple chunks.
+	// With ~111 pages and chunkPages=8, we get ~14 chunks.
+	const chunkPages = 8
+	deps := logical.SnapshotDeps{
+		Catalog: catalog,
+		S3:      s3,
+		SinkCfg: sinkCfg,
+		LogicalCfg: config.LogicalConfig{
+			SnapshotChunkPages:     chunkPages,
+			SnapshotTargetFileSize: 1024 * 1024,
+		},
+		TableCfgs: []config.TableConfig{{Name: "public.big_tbl"}},
+		Schemas:   map[string]*postgres.TableSchema{"public.big_tbl": ts},
+		Store:     store,
+		PipelineID: "test",
+	}
+
+	tables := []logical.SnapshotTable{{Name: "public.big_tbl", Schema: ts}}
+	dsn := pgCfg.DSN()
+	txFactory := func(ctx context.Context) (pgx.Tx, func(context.Context), error) {
+		c, err := pgx.Connect(ctx, dsn)
+		if err != nil {
+			return nil, nil, err
+		}
+		cleanup := func(ctx context.Context) { c.Close(ctx) }
+		tx, err := c.Begin(ctx)
+		if err != nil {
+			cleanup(ctx)
+			return nil, nil, err
+		}
+		if _, err := tx.Exec(ctx, "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"); err != nil {
+			tx.Rollback(ctx)
+			cleanup(ctx)
+			return nil, nil, err
+		}
+		return tx, cleanup, nil
+	}
+
+	snap := logical.NewSnapshotter(tables, txFactory, 1, deps)
+	results, err := snap.Run(ctx)
+	if err != nil {
+		t.Fatalf("snapshot run: %v", err)
+	}
+
+	if results[0].Err != nil {
+		t.Fatalf("snapshot error: %v", results[0].Err)
+	}
+	if results[0].Rows != rowCount {
+		t.Errorf("expected %d rows, got %d", rowCount, results[0].Rows)
+	}
+
+	// Verify multiple Iceberg snapshots were committed (one per chunk).
+	tm, _ := catalog.LoadTable(sinkCfg.Namespace, "big_tbl")
+	if tm == nil {
+		t.Fatal("table not found in catalog")
+	}
+	numSnapshots := len(tm.Metadata.Snapshots)
+	t.Logf("Iceberg snapshots committed: %d (relpages=%d, chunk_pages=%d)", numSnapshots, relpages, chunkPages)
+	if numSnapshots <= 1 {
+		t.Errorf("expected multiple Iceberg snapshots (one per CTID chunk), got %d", numSnapshots)
+	}
+
+	// Verify checkpoint: table complete, no leftover chunk state.
+	cp, _ := store.Load("test")
+	if !cp.SnapshotedTables["public.big_tbl"] {
+		t.Error("expected big_tbl in SnapshotedTables")
+	}
+	if len(cp.SnapshotChunks) != 0 {
+		t.Errorf("expected empty SnapshotChunks, got %v", cp.SnapshotChunks)
+	}
+
+	// No data loss: verify total row count across all Parquet data files.
+	verifyParquetRowCount(t, ctx, s3, tm, ts, rowCount)
+
+	// Read back all rows and verify every ID is present.
+	allRows := readAllDataFileRows(t, ctx, s3, tm)
+	idSet := make(map[int32]bool, len(allRows))
+	for _, row := range allRows {
+		if id, ok := row["id"].(int32); ok {
+			idSet[id] = true
+		}
+	}
+	for i := int32(1); i <= rowCount; i++ {
+		if !idSet[i] {
+			t.Errorf("data loss: row id=%d missing from materialized data files", i)
+		}
+	}
+	t.Logf("no data loss: all %d IDs present across %d chunks", len(idSet), numSnapshots)
+}
+
 // verifyParquetRowCount reads the manifest chain from the catalog and counts
 // total rows across all data files.
 func verifyParquetRowCount(t *testing.T, ctx context.Context, s3 *memStorage, tm *iceberg.TableMetadata, ts *postgres.TableSchema, expectedRows int) {
